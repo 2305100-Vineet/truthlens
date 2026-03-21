@@ -1,8 +1,6 @@
 fastapi
 uvicorn[standard]
 gunicorn
-transformers
-torch>=2.9.0
 jinja2
 python-multipart
 requests
