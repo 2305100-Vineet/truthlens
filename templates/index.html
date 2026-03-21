@@ -82,6 +82,7 @@
     <div class="logo">
       <span class="logo-icon">🔍</span>
       <span class="logo-text">Truth<span class="logo-accent">Lens</span></span>
+      <span class="logo-tag">by Vineet Kumar Jha</span>
     </div>
     <nav class="header-nav">
       <div class="stat-pill"><span class="stat-dot stat-dot--total"></span><span>{{ stats.total or 0 }} scanned</span></div>
@@ -554,7 +555,7 @@
             <!-- Background image div: covers placeholder when image loads -->
             <div id="img-{{ loop.index }}"
               style="position:absolute;inset:0;z-index:2;background-size:cover;background-position:center;background-repeat:no-repeat;opacity:0;transition:opacity 0.35s ease;"
-              data-src="{{ '' if 'picsum' in (article.image or '') else (article.image or '') }}"
+              data-src="{{ article.image }}"
               data-link="{{ article.link }}"
               data-title="{{ article.title }}"
               data-fallback="">
@@ -743,7 +744,7 @@
             <!-- Background image div -->
             <div id="mimg-{{ loop.index }}"
               style="position:absolute;inset:0;z-index:2;background-size:cover;background-position:center;background-repeat:no-repeat;opacity:0;transition:opacity 0.35s ease;"
-              data-src="{{ '' if 'picsum' in (article.image or '') else (article.image or '') }}"
+              data-src="{{ article.image }}"
               data-link="{{ article.link }}"
               data-title="{{ article.title }}"
               data-fallback="">
@@ -813,6 +814,8 @@
   <div class="footer-inner">
     <span class="logo-text-footer">Truth<span class="logo-accent">Lens</span></span>
     <span class="footer-sep">·</span>
+    <span>By <strong style="color:var(--accent)">Vineet Kumar Jha</strong></span>
+    <span class="footer-sep">·</span>
     <span class="footer-hide-sm">Pattern Scoring · Groq · Cohere · Nitter · Reddit · NewsAPI · Wikipedia · Knowledge Base</span>
   </div>
 </footer>
@@ -864,8 +867,11 @@
 
   /* ══ IMAGE LOADER ══════════════════════════════════════════════════
      Priority per card:
-       1. data-src from NewsAPI → try loading directly
-       2. Fails → try allorigins CORS proxy to scrape OG image
+       1. data-src (urlToImage from NewsAPI) → try directly
+          — but ONLY if it's a real news image (not stock/generic)
+       2. data-src fails OR is stock → try allorigins CORS proxy
+          — extracts og:image/twitter:image from actual article page
+          — validates the result is NOT a stock/generic image
        3. Both fail → smart topic-aware picsum fallback based on title
      Topic detection runs in the browser so it always works on Render.
   ════════════════════════════════════════════════════════════════════ */
@@ -879,39 +885,91 @@
   function getTopicFallback(title, index) {
     const t = (title || '').toLowerCase();
     let base = 'news';
-    if (/ukraine|russia|putin|zelensky|nato|troops|missile|invasion|frontline/.test(t))        base = 'war';
-    else if (/israel|gaza|hamas|palestine/.test(t))                                             base = 'mideast';
+    if (/ukraine|russia|putin|zelensky|nato|troops|missile|invasion|frontline/.test(t))         base = 'war';
+    else if (/israel|gaza|hamas|palestine/.test(t))                                              base = 'mideast';
     else if (/trump|biden|kamala|election|president|democrat|republican|capitol|senate/.test(t)) base = 'politics';
-    else if (/isro|chandrayaan|gaganyaan|nasa|space|moon|rocket|satellite|lunar|orbit|spacecraft|astronaut|space day/.test(t)) base = 'space';
-    else if (/cricket|ipl|t20|rohit|kohli|world cup|stadium|olympic|tournament/.test(t))       base = 'sports';
+    else if (/isro|chandrayaan|gaganyaan|nasa|space|moon|rocket|satellite|lunar|orbit|spacecraft|astronaut/.test(t)) base = 'space';
+    else if (/cricket|ipl|t20|rohit|kohli|world cup|stadium|olympic|tournament/.test(t))        base = 'sports';
     else if (/chatgpt|openai|artificial|deepmind|alphafold|tech|google|apple|microsoft|musk|tesla|5g|cyber|digital|software/.test(t)) base = 'tech';
     else if (/economy|stock|market|bitcoin|crypto|inflation|finance|bank|gdp|budget|sensex|nifty|rupee/.test(t)) base = 'finance';
     else if (/covid|corona|vaccine|pandemic|virus|health|hospital|doctor|disease|medicine|mpox/.test(t)) base = 'health';
-    else if (/climate|environment|flood|earthquake|cyclone|drought|pollution/.test(t))          base = 'climate';
-    else if (/fake|fact.check|misinformation|debunk|hoax|conspiracy|misleading/.test(t))        base = 'factcheck';
-    else if (/india|modi|delhi|mumbai|bjp|parliament|lok sabha/.test(t))                        base = 'india';
+    else if (/climate|environment|flood|earthquake|cyclone|drought|pollution/.test(t))           base = 'climate';
+    else if (/fake|fact.check|misinformation|debunk|hoax|conspiracy|misleading/.test(t))         base = 'factcheck';
+    else if (/india|modi|delhi|mumbai|bjp|parliament|lok sabha/.test(t))                         base = 'india';
     const variation = Math.abs(index) % 10;
     return 'https://picsum.photos/seed/' + base + variation + '/800/450';
   }
 
+  /* ── Reject stock/generic/unrelated images ──────────────────────────
+     Returns true if the image URL looks like a stock photo, generic
+     placeholder, or site decoration — NOT a real news article image.
+  ─────────────────────────────────────────────────────────────────── */
   function isStockOrBadImage(url) {
     if (!url) return true;
-    const bad = ['picsum','unsplash','pexels','pixabay','shutterstock','gettyimages',
-                 'stock-photo','placeholder','default-','1x1','pixel','favicon','logo','icon'];
     const ul = url.toLowerCase();
-    return bad.some(b => ul.includes(b));
+
+    // Obvious stock/placeholder services
+    const STOCK_SERVICES = [
+      'unsplash.com', 'pexels.com', 'pixabay.com',
+      'shutterstock.com', 'istockphoto.com', 'gettyimages.com',
+      'stock.adobe.com', 'dreamstime.com', 'depositphotos.com',
+      'alamy.com', 'stocksy.com', 'photostock',
+    ];
+    if (STOCK_SERVICES.some(s => ul.includes(s))) return true;
+
+    // Generic placeholder URL patterns
+    const GENERIC_PATTERNS = [
+      'placeholder', 'default-image', 'no-image', 'noimage',
+      'dummy', 'sample', 'generic', 'stock-photo', 'stockphoto',
+      '1x1', 'pixel.gif', 'spacer', 'blank.', 'transparent.',
+      '/wp-content/uploads/banner', '/wp-content/uploads/logo',
+      '/wp-content/uploads/header', '/wp-content/uploads/bg',
+      '/wp-content/uploads/background', '/wp-content/uploads/default',
+      'site-logo', 'og-default', 'default-og', 'default-thumb',
+      'default-thumbnail', 'no-thumb', 'nothumb',
+    ];
+    if (GENERIC_PATTERNS.some(p => ul.includes(p))) return true;
+
+    // Known sites that serve unrelated stock images as OG images
+    const STOCK_DOMAINS = [
+      'gktoday.in', 'affairscloud.com', 'jagranjosh.com',
+      'testbook.com', 'byjus.com', 'adda247.com', 'oliveboard.in',
+      'currentaffairs4u.com', 'bankersadda.com', 'sscadda.com',
+      'examsdaily.in', 'careermantra.net', 'gradeup.co',
+      'sanskriti.com', 'sanskriti.org',
+    ];
+    try {
+      const host = new URL(url).hostname.replace('www.', '');
+      if (STOCK_DOMAINS.some(d => host === d || host.endsWith('.' + d))) return true;
+    } catch(e) {}
+
+    return false;
   }
 
+  /* ── Extract OG/Twitter image from raw HTML ──────────────────────── */
   function extractOgFromHtml(rawHtml) {
+    // og:image:secure_url first (highest quality)
+    const secM = rawHtml.match(/property=["']og:image:secure_url["'][^>]{0,300}content=["']([^"']{10,})["']/i)
+               || rawHtml.match(/content=["']([^"']{10,})["'][^>]{0,300}property=["']og:image:secure_url["']/i);
+    if (secM && secM[1] && !secM[1].includes('google') && !isStockOrBadImage(secM[1]))
+      return secM[1].trim();
+
+    // og:image
     const ogM = rawHtml.match(/property=["']og:image["'][^>]{0,200}content=["']([^"']{10,})["']/i)
              || rawHtml.match(/content=["']([^"']{10,})["'][^>]{0,200}property=["']og:image["']/i);
-    if (ogM && ogM[1] && !ogM[1].includes('google')) return ogM[1].trim();
+    if (ogM && ogM[1] && !ogM[1].includes('google') && !isStockOrBadImage(ogM[1]))
+      return ogM[1].trim();
+
+    // twitter:image
     const twM = rawHtml.match(/name=["']twitter:image["'][^>]{0,200}content=["']([^"']{10,})["']/i)
              || rawHtml.match(/content=["']([^"']{10,})["'][^>]{0,200}name=["']twitter:image["']/i);
-    if (twM && twM[1]) return twM[1].trim();
+    if (twM && twM[1] && !isStockOrBadImage(twM[1]))
+      return twM[1].trim();
+
     return '';
   }
 
+  /* ── Fetch OG image via allorigins CORS proxy ───────────────────── */
   function tryProxy(articleUrl, el, fallback) {
     if (!articleUrl || articleUrl.includes('news.google.com')) {
       setBg(el, fallback); return;
@@ -933,20 +991,21 @@
       .catch(() => setBg(el, fallback));
   }
 
+  /* ── Main loader per card ────────────────────────────────────────── */
   function loadBgImage(el, index) {
-    const src     = (el.dataset.src   || '').trim();
-    const artUrl  = (el.dataset.link  || '').trim();
-    const title   = (el.dataset.title || '').trim();
-    const fallback = getTopicFallback(title, index);
+    const src      = (el.dataset.src   || '').trim();
+    const artUrl   = (el.dataset.link  || '').trim();
+    const title    = (el.dataset.title || '').trim();
+    const fallback  = getTopicFallback(title, index);
 
-    /* If server gave a real image URL (not picsum/stock) → try it first */
     if (src && !isStockOrBadImage(src)) {
+      /* Server gave a real image URL → try loading it directly */
       const img = new Image();
       img.onload  = () => setBg(el, src);
       img.onerror = () => tryProxy(artUrl, el, fallback);
       img.src = src;
     } else {
-      /* Server gave nothing useful → go straight to proxy → fallback */
+      /* No src, or src is stock/generic → go straight to proxy then fallback */
       tryProxy(artUrl, el, fallback);
     }
   }
@@ -958,5 +1017,3 @@
     });
   });
 </script>
-</body>
-</html>
