@@ -965,9 +965,32 @@
             'gettyimages','istockphoto','stock.adobe'].some(b => u.includes(b));
   }
 
-  /* ── Microlink API — fetches real OG image server-side ──────────── */
+  /* ── Known sites that serve generic landscape/stock OG images ───────
+     For these, skip Microlink and go straight to topic fallback.
+     Britannica/PBS/Statista/ScoopWhoop all use decorative photography.
+  ─────────────────────────────────────────────────────────────────── */
+  const GENERIC_OG_SITES = [
+    'britannica.com', 'statista.com', 'pewresearch.org',
+    'cfr.org', 'un.org', 'who.int', 'worldbank.org',
+    'imf.org', 'brookings.edu', 'rand.org', 'csis.org',
+    'foreignaffairs.com', 'foreignpolicy.com', 'chathamhouse.org',
+    'carnegieendowment.org', 'wilsoncenter.org', 'usip.org',
+    'pbs.org', 'scoopwhoop.com', 'theatlantic.com',
+    'newyorker.com', 'smithsonianmag.com', 'nationalgeographic.com',
+    'history.com', 'thoughtco.com', 'worldatlas.com',
+    'infoplease.com', 'reference.com',
+  ];
+
+  function isGenericOgSite(url) {
+    try {
+      const host = new URL(url).hostname.replace(/^www\./, '');
+      return GENERIC_OG_SITES.some(d => host === d || host.endsWith('.' + d));
+    } catch(e) { return false; }
+  }
+
+  /* ── Microlink API — fetches real OG image from article page ────── */
   function fetchViaLink(articleUrl, el, fallback) {
-    if (!articleUrl || articleUrl.includes('news.google.com')) {
+    if (!articleUrl || articleUrl.includes('news.google.com') || isGenericOgSite(articleUrl)) {
       setBg(el, fallback); return;
     }
     const api = 'https://api.microlink.io/?url=' + encodeURIComponent(articleUrl)
@@ -975,8 +998,8 @@
     fetch(api, { signal: AbortSignal.timeout(8000) })
       .then(r => r.ok ? r.json() : Promise.reject())
       .then(data => {
-        const img_url = data?.data?.image?.url || data?.data?.logo?.url || '';
-        if (img_url && !isBadImage(img_url)) {
+        const img_url = data?.data?.image?.url || '';
+        if (img_url && !isBadImage(img_url) && !isGenericOgSite(img_url)) {
           const img = new Image();
           img.onload  = () => setBg(el, img_url);
           img.onerror = () => setBg(el, fallback);
@@ -1002,7 +1025,7 @@
       img.onerror = () => fetchViaLink(artUrl, el, fallback);
       img.src = src;
     } else {
-      /* No urlToImage → ask Microlink for the article's OG image */
+      /* No urlToImage → try Microlink unless site is known to use generic OG images */
       fetchViaLink(artUrl, el, fallback);
     }
   }
