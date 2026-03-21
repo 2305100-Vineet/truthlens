@@ -866,14 +866,11 @@
   {% endif %}
 
   /* ══ IMAGE LOADER ══════════════════════════════════════════════════
-     Priority per card:
-       1. data-src (urlToImage from NewsAPI) → try directly
-          — but ONLY if it's a real news image (not stock/generic)
-       2. data-src fails OR is stock → try allorigins CORS proxy
-          — extracts og:image/twitter:image from actual article page
-          — validates the result is NOT a stock/generic image
-       3. Both fail → smart topic-aware picsum fallback based on title
-     Topic detection runs in the browser so it always works on Render.
+     3-tier pipeline per card:
+       1. data-src (urlToImage from NewsAPI) → best, try first
+       2. Microlink API → fetches real OG image from article URL
+          (free, no auth, runs from their servers, not ours)
+       3. Topic-specific Wikimedia fallback → always relevant
   ════════════════════════════════════════════════════════════════════ */
 
   function setBg(el, src) {
@@ -958,90 +955,32 @@
     return arr[Math.abs(index) % arr.length];
   }
 
-  /* ── Reject stock/generic/unrelated images ──────────────────────────
-     Returns true if the image URL looks like a stock photo, generic
-     placeholder, or site decoration — NOT a real news article image.
-  ─────────────────────────────────────────────────────────────────── */
-  function isStockOrBadImage(url) {
-    if (!url) return true;
-    const ul = url.toLowerCase();
-
-    // Obvious stock/placeholder services
-    const STOCK_SERVICES = [
-      'unsplash.com', 'pexels.com', 'pixabay.com',
-      'shutterstock.com', 'istockphoto.com', 'gettyimages.com',
-      'stock.adobe.com', 'dreamstime.com', 'depositphotos.com',
-      'alamy.com', 'stocksy.com', 'photostock',
-    ];
-    if (STOCK_SERVICES.some(s => ul.includes(s))) return true;
-
-    // Generic placeholder URL patterns
-    const GENERIC_PATTERNS = [
-      'placeholder', 'default-image', 'no-image', 'noimage',
-      'dummy', 'sample', 'generic', 'stock-photo', 'stockphoto',
-      '1x1', 'pixel.gif', 'spacer', 'blank.', 'transparent.',
-      '/wp-content/uploads/banner', '/wp-content/uploads/logo',
-      '/wp-content/uploads/header', '/wp-content/uploads/bg',
-      '/wp-content/uploads/background', '/wp-content/uploads/default',
-      'site-logo', 'og-default', 'default-og', 'default-thumb',
-      'default-thumbnail', 'no-thumb', 'nothumb',
-    ];
-    if (GENERIC_PATTERNS.some(p => ul.includes(p))) return true;
-
-    // Known sites that serve unrelated stock images as OG images
-    const STOCK_DOMAINS = [
-      'gktoday.in', 'affairscloud.com', 'jagranjosh.com',
-      'testbook.com', 'byjus.com', 'adda247.com', 'oliveboard.in',
-      'currentaffairs4u.com', 'bankersadda.com', 'sscadda.com',
-      'examsdaily.in', 'careermantra.net', 'gradeup.co',
-      'sanskriti.com', 'sanskriti.org',
-    ];
-    try {
-      const host = new URL(url).hostname.replace('www.', '');
-      if (STOCK_DOMAINS.some(d => host === d || host.endsWith('.' + d))) return true;
-    } catch(e) {}
-
-    return false;
+  /* ── Reject definite junk images ────────────────────────────────── */
+  function isBadImage(url) {
+    if (!url || !url.startsWith('http')) return true;
+    const u = url.toLowerCase();
+    return ['favicon','1x1','pixel','spacer','placeholder','no-image',
+            'noimage','sprite','news.google.com','google.com/s2',
+            'unsplash.com','pexels.com','pixabay.com','shutterstock',
+            'gettyimages','istockphoto','stock.adobe'].some(b => u.includes(b));
   }
 
-  /* ── Extract OG/Twitter image from raw HTML ──────────────────────── */
-  function extractOgFromHtml(rawHtml) {
-    // og:image:secure_url first (highest quality)
-    const secM = rawHtml.match(/property=["']og:image:secure_url["'][^>]{0,300}content=["']([^"']{10,})["']/i)
-               || rawHtml.match(/content=["']([^"']{10,})["'][^>]{0,300}property=["']og:image:secure_url["']/i);
-    if (secM && secM[1] && !secM[1].includes('google') && !isStockOrBadImage(secM[1]))
-      return secM[1].trim();
-
-    // og:image
-    const ogM = rawHtml.match(/property=["']og:image["'][^>]{0,200}content=["']([^"']{10,})["']/i)
-             || rawHtml.match(/content=["']([^"']{10,})["'][^>]{0,200}property=["']og:image["']/i);
-    if (ogM && ogM[1] && !ogM[1].includes('google') && !isStockOrBadImage(ogM[1]))
-      return ogM[1].trim();
-
-    // twitter:image
-    const twM = rawHtml.match(/name=["']twitter:image["'][^>]{0,200}content=["']([^"']{10,})["']/i)
-             || rawHtml.match(/content=["']([^"']{10,})["'][^>]{0,200}name=["']twitter:image["']/i);
-    if (twM && twM[1] && !isStockOrBadImage(twM[1]))
-      return twM[1].trim();
-
-    return '';
-  }
-
-  /* ── Fetch OG image via allorigins CORS proxy ───────────────────── */
-  function tryProxy(articleUrl, el, fallback) {
+  /* ── Microlink API — fetches real OG image server-side ──────────── */
+  function fetchViaLink(articleUrl, el, fallback) {
     if (!articleUrl || articleUrl.includes('news.google.com')) {
       setBg(el, fallback); return;
     }
-    const proxy = 'https://api.allorigins.win/get?url=' + encodeURIComponent(articleUrl);
-    fetch(proxy, { signal: AbortSignal.timeout(6000) })
+    const api = 'https://api.microlink.io/?url=' + encodeURIComponent(articleUrl)
+              + '&meta=false&screenshot=false';
+    fetch(api, { signal: AbortSignal.timeout(8000) })
       .then(r => r.ok ? r.json() : Promise.reject())
       .then(data => {
-        const og = data && data.contents ? extractOgFromHtml(data.contents) : '';
-        if (og && !isStockOrBadImage(og)) {
+        const img_url = data?.data?.image?.url || data?.data?.logo?.url || '';
+        if (img_url && !isBadImage(img_url)) {
           const img = new Image();
-          img.onload  = () => setBg(el, og);
+          img.onload  = () => setBg(el, img_url);
           img.onerror = () => setBg(el, fallback);
-          img.src = og;
+          img.src = img_url;
         } else {
           setBg(el, fallback);
         }
@@ -1049,22 +988,22 @@
       .catch(() => setBg(el, fallback));
   }
 
-  /* ── Main loader per card ────────────────────────────────────────── */
+  /* ── Main loader ─────────────────────────────────────────────────── */
   function loadBgImage(el, index) {
     const src      = (el.dataset.src   || '').trim();
     const artUrl   = (el.dataset.link  || '').trim();
     const title    = (el.dataset.title || '').trim();
-    const fallback  = getTopicFallback(title, index);
+    const fallback = getTopicFallback(title, index);
 
-    if (src && !isStockOrBadImage(src)) {
-      /* Server gave a real image URL → try loading it directly */
+    if (src && !isBadImage(src)) {
+      /* NewsAPI gave us a urlToImage — try it first */
       const img = new Image();
       img.onload  = () => setBg(el, src);
-      img.onerror = () => tryProxy(artUrl, el, fallback);
+      img.onerror = () => fetchViaLink(artUrl, el, fallback);
       img.src = src;
     } else {
-      /* No src, or src is stock/generic → go straight to proxy then fallback */
-      tryProxy(artUrl, el, fallback);
+      /* No urlToImage → ask Microlink for the article's OG image */
+      fetchViaLink(artUrl, el, fallback);
     }
   }
 
