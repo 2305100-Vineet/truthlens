@@ -862,16 +862,44 @@
   setTimeout(() => document.getElementById('results')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 300);
   {% endif %}
 
-  /* ══ IMAGE LOADER — server has no internet, browser does the work ══
+  /* ══ IMAGE LOADER ══════════════════════════════════════════════════
      Priority per card:
-       1. data-src (urlToImage from NewsAPI) → load directly
-       2. data-src fails → try allorigins CORS proxy for OG image
-       3. Both fail → data-fallback (smart picsum topic image) always loads
+       1. data-src from NewsAPI → try loading directly
+       2. Fails → try allorigins CORS proxy to scrape OG image
+       3. Both fail → smart topic-aware picsum fallback based on title
+     Topic detection runs in the browser so it always works on Render.
   ════════════════════════════════════════════════════════════════════ */
 
   function setBg(el, src) {
     el.style.backgroundImage = 'url(' + src + ')';
     el.style.opacity = '1';
+  }
+
+  /* Smart topic fallback — reads article title and picks relevant image */
+  function getTopicFallback(title, index) {
+    const t = (title || '').toLowerCase();
+    let base = 'news';
+    if (/ukraine|russia|putin|zelensky|nato|troops|missile|invasion|frontline/.test(t))        base = 'war';
+    else if (/israel|gaza|hamas|palestine/.test(t))                                             base = 'mideast';
+    else if (/trump|biden|kamala|election|president|democrat|republican|capitol|senate/.test(t)) base = 'politics';
+    else if (/isro|chandrayaan|gaganyaan|nasa|space|moon|rocket|satellite|lunar|orbit|spacecraft|astronaut|space day/.test(t)) base = 'space';
+    else if (/cricket|ipl|t20|rohit|kohli|world cup|stadium|olympic|tournament/.test(t))       base = 'sports';
+    else if (/chatgpt|openai|artificial|deepmind|alphafold|tech|google|apple|microsoft|musk|tesla|5g|cyber|digital|software/.test(t)) base = 'tech';
+    else if (/economy|stock|market|bitcoin|crypto|inflation|finance|bank|gdp|budget|sensex|nifty|rupee/.test(t)) base = 'finance';
+    else if (/covid|corona|vaccine|pandemic|virus|health|hospital|doctor|disease|medicine|mpox/.test(t)) base = 'health';
+    else if (/climate|environment|flood|earthquake|cyclone|drought|pollution/.test(t))          base = 'climate';
+    else if (/fake|fact.check|misinformation|debunk|hoax|conspiracy|misleading/.test(t))        base = 'factcheck';
+    else if (/india|modi|delhi|mumbai|bjp|parliament|lok sabha/.test(t))                        base = 'india';
+    const variation = Math.abs(index) % 10;
+    return 'https://picsum.photos/seed/' + base + variation + '/800/450';
+  }
+
+  function isStockOrBadImage(url) {
+    if (!url) return true;
+    const bad = ['picsum','unsplash','pexels','pixabay','shutterstock','gettyimages',
+                 'stock-photo','placeholder','default-','1x1','pixel','favicon','logo','icon'];
+    const ul = url.toLowerCase();
+    return bad.some(b => ul.includes(b));
   }
 
   function extractOgFromHtml(rawHtml) {
@@ -889,13 +917,13 @@
       setBg(el, fallback); return;
     }
     const proxy = 'https://api.allorigins.win/get?url=' + encodeURIComponent(articleUrl);
-    fetch(proxy, { signal: AbortSignal.timeout(7000) })
+    fetch(proxy, { signal: AbortSignal.timeout(6000) })
       .then(r => r.ok ? r.json() : Promise.reject())
       .then(data => {
         const og = data && data.contents ? extractOgFromHtml(data.contents) : '';
-        if (og) {
+        if (og && !isStockOrBadImage(og)) {
           const img = new Image();
-          img.onload = () => setBg(el, og);
+          img.onload  = () => setBg(el, og);
           img.onerror = () => setBg(el, fallback);
           img.src = og;
         } else {
@@ -905,25 +933,28 @@
       .catch(() => setBg(el, fallback));
   }
 
-  function loadBgImage(el) {
-    const src      = (el.dataset.src      || '').trim();
-    const artUrl   = (el.dataset.link     || '').trim();
-    const fallback = (el.dataset.fallback || '').trim();
+  function loadBgImage(el, index) {
+    const src     = (el.dataset.src   || '').trim();
+    const artUrl  = (el.dataset.link  || '').trim();
+    const title   = (el.dataset.title || '').trim();
+    const fallback = getTopicFallback(title, index);
 
-    if (src) {
+    /* If server gave a real image URL (not picsum/stock) → try it first */
+    if (src && !isStockOrBadImage(src)) {
       const img = new Image();
       img.onload  = () => setBg(el, src);
       img.onerror = () => tryProxy(artUrl, el, fallback);
       img.src = src;
     } else {
+      /* Server gave nothing useful → go straight to proxy → fallback */
       tryProxy(artUrl, el, fallback);
     }
   }
 
   /* Run on all image divs after DOM is ready */
   document.addEventListener('DOMContentLoaded', function() {
-    document.querySelectorAll('[data-src]').forEach(function(el) {
-      loadBgImage(el);
+    document.querySelectorAll('[data-src]').forEach(function(el, index) {
+      loadBgImage(el, index);
     });
   });
 </script>
