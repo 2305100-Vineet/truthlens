@@ -1,0 +1,931 @@
+<!-- templates/index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TruthLens — AI Fake News Detector</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,300&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
+  <style>
+    /* ── Image card fix: image sits ON TOP of placeholder, covers it fully ── */
+    .news-card-image-wrap,
+    .more-article-img-wrap {
+      position: relative;
+      overflow: hidden;
+      background: #0d1117;
+    }
+
+    /* Placeholder always behind */
+    .ncard-placeholder {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      z-index: 1;
+      pointer-events: none;
+    }
+
+    /* Image always on top — covers placeholder when it loads */
+    .news-card-img,
+    .more-article-img {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      z-index: 2;
+      display: block;
+      transition: opacity 0.3s ease;
+    }
+
+    /* Badges always on top of image */
+    .news-card-debunk-badge,
+    .news-card-source-chip,
+    .more-article-debunk-badge,
+    .more-article-src-chip {
+      position: relative;
+      z-index: 3;
+    }
+
+    /* Image loading state */
+    .news-card-img.img-loading,
+    .more-article-img.img-loading {
+      opacity: 0;
+    }
+    .news-card-img.img-loaded,
+    .more-article-img.img-loaded {
+      opacity: 1;
+    }
+    .news-card-img.img-error,
+    .more-article-img.img-error {
+      opacity: 0;
+      z-index: 0; /* send behind placeholder on error */
+    }
+  </style>
+</head>
+<body>
+
+<div class="bg-grid"></div>
+<div class="bg-orbs">
+  <div class="orb orb-1"></div>
+  <div class="orb orb-2"></div>
+  <div class="orb orb-3"></div>
+</div>
+
+<header class="header">
+  <div class="header-inner">
+    <div class="logo">
+      <span class="logo-icon">🔍</span>
+      <span class="logo-text">Truth<span class="logo-accent">Lens</span></span>
+    </div>
+    <nav class="header-nav">
+      <div class="stat-pill"><span class="stat-dot stat-dot--total"></span><span>{{ stats.total or 0 }} scanned</span></div>
+      <div class="stat-pill stat-pill--hide-sm"><span class="stat-dot stat-dot--fake"></span><span>{{ stats.fake or 0 }} fake</span></div>
+      <div class="stat-pill stat-pill--hide-sm"><span class="stat-dot stat-dot--real"></span><span>{{ stats.real or 0 }} real</span></div>
+    </nav>
+  </div>
+</header>
+
+<main class="main">
+
+  <section class="hero">
+    <div class="hero-eyebrow">
+      <span class="pulse-dot"></span>
+      Pattern Scoring · Groq · Cohere · Nitter · Reddit · NewsAPI · Wikipedia · Multilingual · Knowledge Base
+    </div>
+    <h1 class="hero-title">
+      See Through<br/>
+      <span class="hero-accent">Fake News</span><br/>
+      with AI
+    </h1>
+    <p class="hero-sub">Paste any headline or article in <strong>any language</strong> — TruthLens analyses it with 2 independent AIs, live Reddit &amp; Twitter discussion, fact-check APIs, a verified events knowledge base, and real news coverage.</p>
+  </section>
+
+  <!-- ══ SCAN FORM ══════════════════════════════════════════════════════ -->
+  <section class="scan-section">
+    <form method="POST" action="/predict" id="scanForm">
+      <div class="input-box">
+        <div class="input-header">
+          <span class="input-header-left"><span class="label-icon">◈</span> PASTE NEWS TEXT HERE</span>
+          <span class="char-counter" id="charCount">0 / 512</span>
+        </div>
+        <textarea name="text" id="inputText" class="scan-textarea" maxlength="512"
+          placeholder="Type or paste a news headline or article in any language — English, Hindi, Spanish, French, Arabic…
+&#10;&#10;↓ Or click a sample below to load it, then click ANALYSE to check it"
+          required>{{ text or '' }}</textarea>
+      </div>
+
+      <!-- ══ SAMPLE HEADLINES ══════════════════════════════════════════ -->
+      <div class="samples-block">
+        <div class="samples-title">
+          <span class="label-icon">◈</span> CLICK A SAMPLE TO LOAD IT — then click ANALYSE to check
+          <span class="samples-hint-badge">click → loads text · then analyse →</span>
+        </div>
+
+        <div class="samples-lang-label">💻 Technology</div>
+        <div class="samples-grid">
+          <div class="sample-group">
+            <div class="sample-group-label sample-group-label--real">✓ Real News</div>
+            <button type="button" class="sample-btn sample-btn--real"
+              onclick="loadSample('OpenAI ChatGPT has surpassed 300 million weekly active users worldwide. The AI chatbot continues to transform how people work and learn globally, with Apple announcing a partnership to integrate ChatGPT into Apple Intelligence on iPhone, iPad, and Mac.')">
+              🤖 ChatGPT hits 300M weekly users
+            </button>
+            <button type="button" class="sample-btn sample-btn--real"
+              onclick="loadSample('Elon Musk completed his $44 billion acquisition of Twitter and rebranded the platform to X. The deal was followed by mass layoffs, advertiser departures, and a major redesign of the platform\'s verification system.')">
+              🐦 Elon Musk acquires Twitter, renames to X
+            </button>
+            <button type="button" class="sample-btn sample-btn--real"
+              onclick="loadSample('Sam Altman was fired as OpenAI CEO by the board, triggering a staff revolt. Nearly all 700 employees threatened to quit. Microsoft offered jobs to the entire team. Altman was reinstated within five days after massive investor pressure.')">
+              🔄 Sam Altman fired and reinstated at OpenAI
+            </button>
+          </div>
+          <div class="sample-group">
+            <div class="sample-group-label sample-group-label--fake">⚠ Fake / Misleading</div>
+            <button type="button" class="sample-btn sample-btn--fake"
+              onclick="loadSample('5G towers are secretly spreading COVID-19 and the government is hiding this dangerous truth. Scientists have proven the direct link between 5G radiation and coronavirus, but Big Pharma and mainstream media are suppressing the evidence.')">
+              📡 5G towers cause COVID-19
+            </button>
+            <button type="button" class="sample-btn sample-btn--fake"
+              onclick="loadSample('COVID-19 vaccines contain microchips developed by Bill Gates to allow governments to track and control every citizen. A whistleblower nurse has exposed this shocking truth hidden inside the vaccine vial.')">
+              💉 COVID vaccine has tracking microchip
+            </button>
+            <button type="button" class="sample-btn sample-btn--fake"
+              onclick="loadSample('Mark Zuckerberg is secretly a reptilian alien who infiltrated human society to control Facebook and harvest personal data for an extraterrestrial civilisation planning a takeover of planet Earth.')">
+              🦎 Zuckerberg is a reptilian alien
+            </button>
+          </div>
+        </div>
+
+        <div class="samples-lang-label" style="color:#60a5fa;background:rgba(96,165,250,0.1);border-color:rgba(96,165,250,0.25)">🌍 Politics &amp; World Events</div>
+        <div class="samples-grid">
+          <div class="sample-group">
+            <div class="sample-group-label sample-group-label--real">✓ Real News</div>
+            <button type="button" class="sample-btn sample-btn--real"
+              onclick="loadSample('Donald Trump won the 2024 United States presidential election, defeating Democratic candidate Kamala Harris. Trump secured enough Electoral College votes and Republicans also reclaimed control of the Senate.')">
+              🗳️ Trump wins 2024 US election
+            </button>
+            <button type="button" class="sample-btn sample-btn--real"
+              onclick="loadSample('Russia launched a full-scale military invasion of Ukraine in February 2022, crossing the border with tanks and troops. The war displaced over 8 million civilians and triggered the largest refugee crisis in Europe since World War II.')">
+              🇺🇦 Russia invades Ukraine 2022
+            </button>
+            <button type="button" class="sample-btn sample-btn--real"
+              onclick="loadSample('Hamas launched a devastating surprise attack on Israel on October 7, 2023, killing over 1,200 people and taking more than 250 hostages. Israel declared war and launched a major military campaign in the Gaza Strip.')">
+              🕊️ Hamas attacks Israel — October 7, 2023
+            </button>
+          </div>
+          <div class="sample-group">
+            <div class="sample-group-label sample-group-label--fake">⚠ Fake / Misleading</div>
+            <button type="button" class="sample-btn sample-btn--fake"
+              onclick="loadSample('Donald Trump was secretly arrested by the FBI and charged with treason for attempting to overthrow the government. The mainstream media is completely hiding this explosive breaking news to protect the deep state agenda.')">
+              🇺🇸 Trump secretly arrested by FBI
+            </button>
+            <button type="button" class="sample-btn sample-btn--fake"
+              onclick="loadSample('George Soros is secretly funding the Black Lives Matter movement and paying protesters to destabilize America and destroy Western civilization as part of a globalist new world order conspiracy.')">
+              🕵️ Soros secretly funding protests
+            </button>
+            <button type="button" class="sample-btn sample-btn--fake"
+              onclick="loadSample('The Illuminati controls all world governments and financial institutions. They have been secretly directing every major war and economic crisis since 1776, with plans to establish a totalitarian new world order by 2030.')">
+              🔺 Illuminati controls world governments
+            </button>
+          </div>
+        </div>
+
+        <div class="samples-lang-label" style="color:#34d399;background:rgba(52,211,153,0.1);border-color:rgba(52,211,153,0.2)">🧬 Health &amp; Science</div>
+        <div class="samples-grid">
+          <div class="sample-group">
+            <div class="sample-group-label sample-group-label--real">✓ Real News</div>
+            <button type="button" class="sample-btn sample-btn--real"
+              onclick="loadSample('Google DeepMind AlphaFold has solved the protein-folding problem that stumped biologists for 50 years. The AI can predict 3D protein structures with remarkable accuracy, potentially revolutionising drug discovery and cancer treatment.')">
+              🧬 DeepMind AlphaFold solves protein folding
+            </button>
+            <button type="button" class="sample-btn sample-btn--real"
+              onclick="loadSample('ISRO successfully landed the Chandrayaan-3 spacecraft near the south pole of the Moon on August 23, 2023, making India the first country to achieve a soft landing in that region. The Pragyan rover collected surface data.')">
+              🚀 ISRO Chandrayaan-3 lands on Moon
+            </button>
+          </div>
+          <div class="sample-group">
+            <div class="sample-group-label sample-group-label--fake">⚠ Fake / Misleading</div>
+            <button type="button" class="sample-btn sample-btn--fake"
+              onclick="loadSample('Drinking bleach or household disinfectant kills coronavirus inside the human body according to a secret government study. Big Pharma is suppressing this cheap miracle cure because they want to profit from expensive treatments.')">
+              🧪 Bleach cures COVID-19
+            </button>
+            <button type="button" class="sample-btn sample-btn--fake"
+              onclick="loadSample('Climate change and global warming is a complete hoax invented by corrupt scientists to secure government grants. Temperature data has been deliberately fabricated by NASA and NOAA — there is no real scientific evidence the Earth is warming.')">
+              🌡️ Climate change is a hoax
+            </button>
+          </div>
+        </div>
+
+        <div class="samples-lang-label" style="color:#fbbf24;background:rgba(251,191,36,0.1);border-color:rgba(251,191,36,0.2)">📈 Economy &amp; Sports</div>
+        <div class="samples-grid">
+          <div class="sample-group">
+            <div class="sample-group-label sample-group-label--real">✓ Real News</div>
+            <button type="button" class="sample-btn sample-btn--real"
+              onclick="loadSample('India won the ICC T20 World Cup 2024, defeating South Africa by 7 runs in a thrilling final in Barbados. Virat Kohli scored a crucial 76 runs and was named Player of the Match. India ended a 13-year ICC title drought under captain Rohit Sharma.')">
+              🏆 India wins ICC T20 World Cup 2024
+            </button>
+            <button type="button" class="sample-btn sample-btn--real"
+              onclick="loadSample('Apple reported record quarterly revenue of $119.6 billion following the launch of the iPhone 16 series with Apple Intelligence features. The company stock hit an all-time high as demand exceeded initial supply forecasts globally.')">
+              📱 Apple records $119B quarterly revenue
+            </button>
+          </div>
+          <div class="sample-group">
+            <div class="sample-group-label sample-group-label--fake">⚠ Fake / Misleading</div>
+            <button type="button" class="sample-btn sample-btn--fake"
+              onclick="loadSample('NASA has officially confirmed that Earth will experience 15 days of total complete darkness next month due to a rare solar and planetary alignment. World governments are hiding this terrifying information to avoid mass panic.')">
+              🌑 NASA confirms 15 days of darkness
+            </button>
+            <button type="button" class="sample-btn sample-btn--fake"
+              onclick="loadSample('The 1969 Apollo moon landing was completely faked by NASA in a Hollywood studio directed by Stanley Kubrick. Astronauts were paid to lie about it. The US government has been hiding this 50-year conspiracy from the public.')">
+              🌕 Apollo moon landing was faked
+            </button>
+          </div>
+        </div>
+
+        <div class="samples-lang-label samples-lang-label--hindi">🇮🇳 Hindi · फेक न्यूज़ / सच्ची खबर</div>
+        <div class="samples-grid">
+          <div class="sample-group">
+            <div class="sample-group-label sample-group-label--fake">⚠ फेक न्यूज़</div>
+            <button type="button" class="sample-btn sample-btn--fake"
+              onclick="loadSample('5G टावर से कोरोना वायरस फैल रहा है और सरकार इस खतरनाक सच्चाई को जनता से छुपा रही है। वैज्ञानिकों ने इसे साबित कर दिया है लेकिन बड़ी मीडिया इस सच को दबा रही है।')">
+              📡 5G टावर से COVID फैलता है
+            </button>
+            <button type="button" class="sample-btn sample-btn--fake"
+              onclick="loadSample('कोरोना वैक्सीन में माइक्रोचिप लगाई जा रही है जिससे बिल गेट्स और सरकार हर नागरिक को ट्रैक करेगी। एक नर्स ने यह चौंकाने वाला खुलासा किया जिसे मीडिया दबा रही है।')">
+              💉 वैक्सीन में माइक्रोचिप
+            </button>
+          </div>
+          <div class="sample-group">
+            <div class="sample-group-label sample-group-label--real">✓ सच्ची खबर</div>
+            <button type="button" class="sample-btn sample-btn--real"
+              onclick="loadSample('भारत ने ICC T20 विश्व कप 2024 जीत लिया। रोहित शर्मा की कप्तानी में टीम इंडिया ने बारबाडोस में साउथ अफ्रीका को 7 रन से हराया। विराट कोहली ने 76 रनों की शानदार पारी खेली।')">
+              🏏 भारत T20 विश्व कप 2024 जीता
+            </button>
+            <button type="button" class="sample-btn sample-btn--real"
+              onclick="loadSample('इसरो ने 23 अगस्त 2023 को चंद्रयान-3 को चंद्रमा के दक्षिणी ध्रुव के पास सफलतापूर्वक लैंड कराया। भारत ऐसा करने वाला दुनिया का पहला देश बना।')">
+              🚀 चंद्रयान-3 सफल लैंडिंग
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <button type="submit" class="scan-btn" id="scanBtn">
+        <span class="scan-btn-text"><span class="scan-icon">🔍</span> ANALYSE WITH TRUTHLENS</span>
+        <span class="scan-btn-loading" style="display:none"><span class="spinner"></span> ANALYSING…</span>
+      </button>
+    </form>
+  </section>
+
+  <!-- ══════════════════════════════════════════════════════════════════════
+       RESULTS
+  ═══════════════════════════════════════════════════════════════════════ -->
+  {% if prediction %}
+  <section class="results-section" id="results">
+
+    <!-- 1. KB Match Banner -->
+    {% if kb_match_real %}
+    <div class="kb-banner kb-banner--real">
+      <span class="kb-icon">✓</span>
+      <div class="kb-body">
+        <div class="kb-label">◈ KNOWLEDGE BASE — VERIFIED REAL EVENT</div>
+        <div class="kb-text">{{ kb_match_real[0] }}</div>
+      </div>
+      <div class="kb-confidence">{{ (kb_match_real[2] * 100)|round|int }}% match</div>
+    </div>
+    {% elif kb_match_fake %}
+    <div class="kb-banner kb-banner--fake">
+      <span class="kb-icon">⚠</span>
+      <div class="kb-body">
+        <div class="kb-label">◈ KNOWLEDGE BASE — KNOWN MISINFORMATION PATTERN</div>
+        <div class="kb-text">{{ kb_match_fake[0] }}</div>
+      </div>
+      <div class="kb-confidence">{{ (kb_match_fake[2] * 100)|round|int }}% match</div>
+    </div>
+    {% endif %}
+
+    <!-- 2. Verdict Banner -->
+    <div class="verdict-banner verdict-banner--{{ 'fake' if prediction == 'FAKE NEWS' else 'real' }}">
+      <div class="verdict-left">
+        <div class="verdict-icon">{{ '✕' if prediction == 'FAKE NEWS' else '✓' }}</div>
+        <div>
+          <div class="verdict-label">TRUTHLENS VERDICT</div>
+          <div class="verdict-text">{{ prediction }}</div>
+        </div>
+      </div>
+      <div class="verdict-right">
+        <div class="verdict-conf">{{ confidence }}%</div>
+        <div class="verdict-conf-label">CONFIDENCE</div>
+      </div>
+    </div>
+
+    <div class="scanned-preview">
+      <div class="scanned-label">◈ ANALYSED TEXT</div>
+      <div class="scanned-text">"{{ text }}"</div>
+    </div>
+
+    <!-- 3. Metrics -->
+    <div class="metrics-grid">
+      <div class="metric-card">
+        <div class="metric-title">◈ PROBABILITY BREAKDOWN</div>
+        <div class="prob-row">
+          <span class="prob-label prob-label--real">REAL</span>
+          <div class="prob-bar-track"><div class="prob-bar prob-bar--real" style="width:{{ real_prob }}%"></div></div>
+          <span class="prob-value">{{ real_prob }}%</span>
+        </div>
+        <div class="prob-row">
+          <span class="prob-label prob-label--fake">FAKE</span>
+          <div class="prob-bar-track"><div class="prob-bar prob-bar--fake" style="width:{{ fake_prob }}%"></div></div>
+          <span class="prob-value">{{ fake_prob }}%</span>
+        </div>
+        <div class="model-badge">
+          <span class="model-badge-icon">⚡</span>
+          <span>Pattern Scoring Engine + KB</span>
+        </div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-title">◈ CREDIBILITY SCORE</div>
+        <div class="cred-ring-wrap">
+          <svg class="cred-ring" viewBox="0 0 120 120">
+            <circle cx="60" cy="60" r="50" class="ring-bg"/>
+            <circle cx="60" cy="60" r="50" class="ring-fill"
+              stroke="{{ risk_color }}"
+              stroke-dasharray="{{ (credibility/100)*314.16 }} 314.16"/>
+          </svg>
+          <div class="cred-ring-text">
+            <span class="cred-score">{{ credibility }}</span>
+            <span class="cred-max">/100</span>
+          </div>
+        </div>
+        <div class="risk-tag" style="color:{{ risk_color }};border-color:{{ risk_color }}20">{{ risk_level }}</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-title">◈ SIGNAL ANALYSIS</div>
+        {% if suspicious %}
+        <div class="signals-group">
+          <div class="signals-label signals-label--sus">⚠ Suspicious</div>
+          {% for s in suspicious %}<div class="signal-tag signal-tag--sus">{{ s }}</div>{% endfor %}
+        </div>
+        {% endif %}
+        {% if credible %}
+        <div class="signals-group">
+          <div class="signals-label signals-label--cred">✓ Credible</div>
+          {% for c in credible %}<div class="signal-tag signal-tag--cred">{{ c }}</div>{% endfor %}
+        </div>
+        {% endif %}
+        {% if not suspicious and not credible %}<div class="signals-neutral">No strong signals detected</div>{% endif %}
+      </div>
+    </div>
+
+    <div class="explanation-card">
+      <div class="explanation-icon">🔍</div>
+      <div class="explanation-body">
+        <div class="explanation-title">TRUTHLENS ANALYSIS</div>
+        <div class="explanation-text">{{ explanation }}</div>
+      </div>
+      <div class="elapsed-badge">{{ elapsed }}ms</div>
+    </div>
+
+    {% if fact_checks %}
+    <div class="factcheck-section">
+      <div class="section-title">
+        <span>◈ FACT-CHECK VERDICTS</span>
+        <span class="section-count">{{ fact_checks|length }} checked</span>
+      </div>
+      <div class="factcheck-results">
+        {% for fc in fact_checks %}
+        <a href="{{ fc.url }}" target="_blank" rel="noopener" class="fc-result-card fc-result-card--{{ fc.rating_type }}">
+          <div class="fc-rating-badge fc-rating-badge--{{ fc.rating_type }}">{{ fc.rating or fc.rating_type }}</div>
+          <div class="fc-result-body">
+            <div class="fc-result-claim">{{ fc.claim }}</div>
+            <div class="fc-result-meta">
+              <span class="fc-publisher">{{ fc.publisher }}</span>
+              {% if fc.claimant and fc.claimant != 'Unknown' %}<span class="news-source-sep">·</span><span class="fc-claimant">{{ fc.claimant }}</span>{% endif %}
+            </div>
+          </div>
+          <span class="fc-arrow">→</span>
+        </a>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- Wikipedia Context -->
+    {% if wiki_context %}
+    <a href="{{ wiki_context.url }}" target="_blank" rel="noopener" class="wiki-card">
+      <div class="wiki-card-inner">
+        <div class="wiki-img-wrap" data-title="{{ wiki_context.title }}">
+          <div class="wiki-placeholder-bg"></div>
+          <div class="wiki-placeholder-content">
+            <div class="wiki-placeholder-icon">📖</div>
+            <div class="wiki-placeholder-label">{{ wiki_context.title[:20] }}</div>
+          </div>
+          {% if wiki_context.image %}
+          <img class="wiki-img" src="{{ wiki_context.image }}" alt="{{ wiki_context.title }}" loading="lazy"
+            onerror="this.style.opacity='0'" />
+          {% endif %}
+          <div class="wiki-img-overlay"></div>
+        </div>
+        <div class="wiki-body">
+          <div class="wiki-top-row">
+            <span class="wiki-label-pill">◈ WIKIPEDIA</span>
+            {% if wiki_context.description %}<span class="wiki-description">{{ wiki_context.description }}</span>{% endif %}
+          </div>
+          <div class="wiki-title">{{ wiki_context.title }}</div>
+          <div class="wiki-extract">{{ wiki_context.extract }}</div>
+          <div class="wiki-read-more">Read full article on Wikipedia →</div>
+        </div>
+      </div>
+    </a>
+    {% endif %}
+
+    <!-- 4. AI PANEL -->
+    {% if groq_verdict or cohere_verdict %}
+    <div class="ai-panel-section">
+      <div class="section-title">
+        <span>◈ AI PANEL — 2 INDEPENDENT VERDICTS</span>
+        <span class="section-count ai-panel-badge">✦ MULTI-AI</span>
+      </div>
+      <div class="section-subtitle section-subtitle--{{ 'fake' if prediction == 'FAKE NEWS' else 'real' }}">
+        Two independent AI models analyse the claim and deliver a combined consensus
+      </div>
+      <div class="ai-cards-grid ai-cards-grid--two">
+
+        {% if groq_verdict %}
+        <div class="ai-card ai-card--{{ groq_verdict.verdict_type }}">
+          <div class="ai-card-header">
+            <div class="ai-card-icon ai-card-icon--groq">⚡</div>
+            <div class="ai-card-meta">
+              <div class="ai-card-num">AI #1 · PRIMARY</div>
+              <div class="ai-card-name">{{ groq_verdict.provider }}</div>
+            </div>
+            <div class="ai-card-conf">{{ groq_verdict.confidence }}%</div>
+          </div>
+          <div class="ai-card-verdict ai-card-verdict--{{ groq_verdict.verdict_type }}">{{ groq_verdict.verdict }}</div>
+          <div class="ai-card-reasoning">{{ groq_verdict.reasoning }}</div>
+          {% if groq_verdict.red_flags %}<div class="ai-card-flags">{% for f in groq_verdict.red_flags %}<span class="ai-flag ai-flag--red">⚠ {{ f }}</span>{% endfor %}</div>{% endif %}
+          {% if groq_verdict.credibility_signals %}<div class="ai-card-flags">{% for s in groq_verdict.credibility_signals %}<span class="ai-flag ai-flag--green">✓ {{ s }}</span>{% endfor %}</div>{% endif %}
+          {% if groq_verdict.recommendation %}<div class="ai-card-rec"><span>💡</span> {{ groq_verdict.recommendation }}</div>{% endif %}
+        </div>
+        {% else %}
+        <div class="ai-card ai-card--uncertain ai-card--offline">
+          <div class="ai-card-header">
+            <div class="ai-card-icon ai-card-icon--groq">⚡</div>
+            <div class="ai-card-meta"><div class="ai-card-num">AI #1 · PRIMARY</div><div class="ai-card-name">Groq Llama 3.3-70b</div></div>
+            <div class="ai-card-conf ai-card-conf--offline">—</div>
+          </div>
+          <div class="ai-card-offline-msg">⚠ Groq did not respond. May be rate-limited.</div>
+        </div>
+        {% endif %}
+
+        {% if cohere_verdict %}
+        <div class="ai-card ai-card--{{ cohere_verdict.verdict_type }}">
+          <div class="ai-card-header">
+            <div class="ai-card-icon ai-card-icon--cohere">◎</div>
+            <div class="ai-card-meta">
+              <div class="ai-card-num">AI #2 · SECONDARY</div>
+              <div class="ai-card-name">{{ cohere_verdict.provider }}</div>
+            </div>
+            <div class="ai-card-conf">{{ cohere_verdict.confidence }}%</div>
+          </div>
+          <div class="ai-card-verdict ai-card-verdict--{{ cohere_verdict.verdict_type }}">{{ cohere_verdict.verdict }}</div>
+          <div class="ai-card-reasoning">{{ cohere_verdict.reasoning }}</div>
+          {% if cohere_verdict.red_flags %}<div class="ai-card-flags">{% for f in cohere_verdict.red_flags %}<span class="ai-flag ai-flag--red">⚠ {{ f }}</span>{% endfor %}</div>{% endif %}
+          {% if cohere_verdict.credibility_signals %}<div class="ai-card-flags">{% for s in cohere_verdict.credibility_signals %}<span class="ai-flag ai-flag--green">✓ {{ s }}</span>{% endfor %}</div>{% endif %}
+          {% if cohere_verdict.recommendation %}<div class="ai-card-rec"><span>💡</span> {{ cohere_verdict.recommendation }}</div>{% endif %}
+        </div>
+        {% else %}
+        <div class="ai-card ai-card--uncertain ai-card--offline">
+          <div class="ai-card-header">
+            <div class="ai-card-icon ai-card-icon--cohere">◎</div>
+            <div class="ai-card-meta"><div class="ai-card-num">AI #2 · SECONDARY</div><div class="ai-card-name">Cohere Command R</div></div>
+            <div class="ai-card-conf ai-card-conf--offline">—</div>
+          </div>
+          <div class="ai-card-offline-msg">⚠ Cohere did not respond this time.</div>
+        </div>
+        {% endif %}
+
+      </div>
+
+      {% if consensus %}
+      <div class="consensus-card consensus-card--{{ consensus.verdict_type }}">
+        <div class="consensus-header">
+          <div class="consensus-icon">⚖</div>
+          <div class="consensus-meta">
+            <div class="consensus-label">◈ COMBINED CONSENSUS</div>
+            <div class="consensus-agreement">{{ consensus.agreement }} · Avg {{ consensus.confidence }}% confidence</div>
+          </div>
+          <div class="consensus-verdict consensus-verdict--{{ consensus.verdict_type }}">{{ consensus.verdict }}</div>
+        </div>
+        <div class="consensus-dots">
+          {% for p in consensus.providers %}<span class="consensus-dot consensus-dot--active">{{ p }}</span>{% endfor %}
+        </div>
+      </div>
+      {% endif %}
+    </div>
+    {% endif %}
+
+    <!-- 5. Related News Articles -->
+    {% if related_news %}
+    <div class="related-news-section">
+      <div class="section-title">
+        <span>◈ RELATED NEWS SOURCES</span>
+        <span class="section-count">{{ related_news|length }} articles</span>
+      </div>
+      <div class="section-subtitle section-subtitle--{{ 'fake' if prediction == 'FAKE NEWS' else 'real' }}">
+        {% if prediction == 'FAKE NEWS' %}⚠ Fact-checks &amp; debunking coverage for this claim
+        {% else %}✓ News articles corroborating this story{% endif %}
+      </div>
+      <div class="related-news-grid">
+        {% for article in related_news %}
+        <a href="{{ article.link }}" target="_blank" rel="noopener noreferrer" class="news-card">
+          <div class="news-card-image-wrap" data-source="{{ article.source }}"
+            style="position:relative;overflow:hidden;background:#0d1117;"
+            id="wrap-{{ loop.index }}">
+            <!-- Placeholder: always visible as base -->
+            <div class="ncard-placeholder" style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;z-index:1;">
+              <span class="ncard-initials">{{ article.initials }}</span>
+              <span class="ncard-source-label">{{ article.source or 'News' }}</span>
+            </div>
+            <!-- Background image div: covers placeholder when image loads -->
+            <div id="img-{{ loop.index }}"
+              style="position:absolute;inset:0;z-index:2;background-size:cover;background-position:center;background-repeat:no-repeat;opacity:0;transition:opacity 0.35s ease;"
+              data-src="{{ article.image }}"
+              data-link="{{ article.link }}"
+              data-title="{{ article.title }}"
+              data-fallback="https://picsum.photos/seed/news{{ loop.index }}/800/450">
+            </div>
+            {% if article.is_debunk %}<span class="news-card-debunk-badge" style="position:relative;z-index:4;">FACT CHECK</span>{% endif %}
+            <div class="news-card-source-chip" style="position:relative;z-index:4;">
+              {% if article.favicon %}<img src="{{ article.favicon }}" alt="" width="12" height="12" onerror="this.style.display='none'" class="news-card-source-favicon-img"/>{% endif %}
+              <span class="news-card-source-name">{{ article.source or 'News' }}</span>
+            </div>
+          </div>
+          <div class="news-card-body">
+            <h3 class="news-card-title news-card-title--{{ 'fake' if prediction == 'FAKE NEWS' else 'real' }}">{{ article.title }}</h3>
+            {% if article.description %}<p class="news-card-desc">{{ article.description }}</p>{% endif %}
+            <div class="news-card-footer">
+              {% if article.published %}<span class="news-card-time">🕐 {{ article.published }}</span>{% endif %}
+              <span class="news-card-read">Read →</span>
+            </div>
+          </div>
+        </a>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- 6. Twitter / X Live Discussion -->
+    {% if nitter_tweets %}
+    {% set has_real_tweets = nitter_tweets[0].source != 'search' %}
+    <div class="social-section nitter-section">
+      <div class="section-title">
+        <div class="section-title-left">
+          <span class="platform-icon platform-icon--twitter">
+            <svg viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg" width="14" height="14">
+              <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/>
+            </svg>
+          </span>
+          <span>TWITTER / X — {{ 'LIVE TWEETS' if has_real_tweets else 'SEARCH LINKS' }}</span>
+        </div>
+        <span class="section-count">{{ nitter_tweets|length }} {{ 'tweets' if has_real_tweets else 'searches' }}</span>
+      </div>
+      <div class="section-subtitle section-subtitle--{{ 'fake' if prediction == 'FAKE NEWS' else 'real' }}">
+        {% if has_real_tweets %}
+          {% if prediction == 'FAKE NEWS' %}⚠ Live Twitter/X reactions — fact-checks &amp; debunks
+          {% else %}✓ Live Twitter/X coverage of this story{% endif %}
+        {% else %}
+          Click any card to open the exact Twitter/X search — find live tweets on this topic
+        {% endif %}
+      </div>
+      <div class="nitter-feed">
+        {% for tweet in nitter_tweets %}
+        {% if tweet.source == 'search' %}
+        <a href="{{ tweet.url }}" target="_blank" rel="noopener" class="nitter-card nitter-card--{{ tweet.sentiment }} nitter-card--search">
+          <div class="nitter-card-inner">
+            <div class="nitter-avatar-col">
+              <div class="nitter-avatar nitter-avatar--search">
+                <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18">
+                  <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/>
+                </svg>
+              </div>
+            </div>
+            <div class="nitter-body">
+              <div class="nitter-header-row">
+                <span class="nitter-username nitter-username--search">Twitter / X</span>
+                <span class="nitter-sep">·</span>
+                <span class="nitter-live-badge"><span class="nitter-live-dot"></span>LIVE</span>
+                <span class="nitter-sentiment-pill nitter-sentiment-pill--{{ tweet.sentiment }}">
+                  {{ tweet.badge if tweet.badge else '💬 SEARCH' }}
+                </span>
+              </div>
+              <div class="nitter-search-query">{{ tweet.search_query }}</div>
+              <div class="nitter-footer-row">
+                <span class="nitter-search-cta">
+                  <svg viewBox="0 0 24 24" fill="currentColor" width="11" height="11">
+                    <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/>
+                  </svg>
+                  Find live tweets on Twitter / X →
+                </span>
+              </div>
+            </div>
+          </div>
+        </a>
+        {% else %}
+        <a href="{{ tweet.url }}" target="_blank" rel="noopener" class="nitter-card nitter-card--{{ tweet.sentiment }}">
+          <div class="nitter-card-inner">
+            <div class="nitter-avatar-col">
+              <div class="nitter-avatar">
+                <svg viewBox="0 0 24 24" fill="currentColor" class="nitter-avatar-bird">
+                  <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/>
+                </svg>
+              </div>
+            </div>
+            <div class="nitter-body">
+              <div class="nitter-header-row">
+                <span class="nitter-username">{{ tweet.username }}</span>
+                {% if tweet.time_ago %}<span class="nitter-sep">·</span><span class="nitter-time">{{ tweet.time_ago }}</span>{% endif %}
+                <span class="nitter-sentiment-pill nitter-sentiment-pill--{{ tweet.sentiment }}">
+                  {{ '🔍 FACT CHECK' if tweet.sentiment == 'debunk' else ('📢 VIRAL' if tweet.sentiment == 'spreading' else '💬 TWEET') }}
+                </span>
+              </div>
+              <div class="nitter-text">{{ tweet.text }}</div>
+              <div class="nitter-footer-row">
+                <span class="nitter-via">View on Twitter/X →</span>
+              </div>
+            </div>
+          </div>
+        </a>
+        {% endif %}
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- 7. Reddit Posts -->
+    {% if reddit_posts %}
+    <div class="social-section reddit-section">
+      <div class="section-title">
+        <div class="section-title-left">
+          <span class="platform-icon platform-icon--reddit">
+            <svg viewBox="0 0 20 20" fill="currentColor" width="14" height="14">
+              <path d="M10 0C4.478 0 0 4.478 0 10s4.478 10 10 10 10-4.478 10-10S15.522 0 10 0zm5.883 10.595a1.42 1.42 0 01.047.354c0 1.808-2.107 3.274-4.706 3.274S6.518 12.757 6.518 10.95c0-.12.016-.237.047-.354a1.149 1.149 0 01-.676-1.05 1.152 1.152 0 011.979-.8c.972-.7 2.316-1.148 3.813-1.197l.648-3.047a.194.194 0 01.232-.149l2.143.449a.8.8 0 10.78.76l-1.943-.407-.589 2.77c1.484.058 2.812.508 3.774 1.201a1.152 1.152 0 011.979.8 1.148 1.148 0 01-.622 1.029zM7.868 11.504a.774.774 0 100 1.548.774.774 0 000-1.548zm2.132.774c0 .664.933 1.2 2.085 1.2 1.151 0 2.085-.536 2.085-1.2 0-.663-.934-1.2-2.085-1.2-1.152 0-2.085.537-2.085 1.2zm2.859-.774a.774.774 0 100 1.548.774.774 0 000-1.548z"/>
+            </svg>
+          </span>
+          <span>REDDIT — LIVE COMMUNITY POSTS</span>
+        </div>
+        <span class="section-count">{{ reddit_posts|length }} posts</span>
+      </div>
+      <div class="section-subtitle section-subtitle--{{ 'fake' if prediction == 'FAKE NEWS' else 'real' }}">
+        {% if prediction == 'FAKE NEWS' %}⚠ Reddit discussions questioning or debunking this claim
+        {% else %}✓ Reddit community discussions about this story{% endif %}
+      </div>
+      <div class="reddit-feed">
+        {% for post in reddit_posts %}
+        <a href="{{ post.url }}" target="_blank" rel="noopener" class="reddit-card {% if post.is_debunk %}reddit-card--debunk{% endif %}">
+          <div class="reddit-card-inner">
+            <div class="reddit-upvote-col">
+              <div class="reddit-upvote-arrow">▲</div>
+              <div class="reddit-score">{{ post.score if post.score < 10000 else (post.score // 1000)|string + 'k' }}</div>
+            </div>
+            <div class="reddit-body">
+              <div class="reddit-meta-row">
+                <span class="reddit-subreddit">{{ post.subreddit }}</span>
+                {% if post.time_ago %}<span class="reddit-sep">·</span><span class="reddit-time">{{ post.time_ago }}</span>{% endif %}
+                {% if post.is_debunk %}<span class="reddit-debunk-tag">🔍 FACT CHECK</span>{% endif %}
+              </div>
+              <div class="reddit-title">{{ post.title }}</div>
+              {% if post.text %}<div class="reddit-text">{{ post.text[:180] }}{% if post.text|length > 180 %}…{% endif %}</div>{% endif %}
+              <div class="reddit-footer-row">
+                <span class="reddit-comments">💬 {{ post.num_comments }} comments</span>
+                <span class="reddit-read">View thread →</span>
+              </div>
+            </div>
+          </div>
+        </a>
+        {% endfor %}
+      </div>
+      <a href="https://www.reddit.com/search/?q={{ text[:80]|urlencode }}&sort=relevance" target="_blank" rel="noopener" class="reddit-search-link">
+        <svg viewBox="0 0 20 20" fill="currentColor" width="14" height="14">
+          <path d="M10 0C4.478 0 0 4.478 0 10s4.478 10 10 10 10-4.478 10-10S15.522 0 10 0zm5.883 10.595a1.42 1.42 0 01.047.354c0 1.808-2.107 3.274-4.706 3.274S6.518 12.757 6.518 10.95c0-.12.016-.237.047-.354a1.149 1.149 0 01-.676-1.05 1.152 1.152 0 011.979-.8c.972-.7 2.316-1.148 3.813-1.197l.648-3.047a.194.194 0 01.232-.149l2.143.449a.8.8 0 10.78.76l-1.943-.407-.589 2.77c1.484.058 2.812.508 3.774 1.201a1.152 1.152 0 011.979.8 1.148 1.148 0 01-.622 1.029zM7.868 11.504a.774.774 0 100 1.548.774.774 0 000-1.548zm2.132.774c0 .664.933 1.2 2.085 1.2 1.151 0 2.085-.536 2.085-1.2 0-.663-.934-1.2-2.085-1.2-1.152 0-2.085.537-2.085 1.2zm2.859-.774a.774.774 0 100 1.548.774.774 0 000-1.548z"/>
+        </svg>
+        Search all Reddit discussions →
+      </a>
+    </div>
+    {% endif %}
+
+    <!-- 8. More Supporting/Debunking Articles -->
+    {% if more_articles %}
+    <div class="more-articles-section">
+      <div class="section-title">
+        <span>◈ {{ 'MORE DEBUNKING COVERAGE' if prediction == 'FAKE NEWS' else 'MORE SUPPORTING COVERAGE' }}</span>
+        <span class="section-count">{{ more_articles|length }} articles</span>
+      </div>
+      <div class="section-subtitle section-subtitle--{{ 'fake' if prediction == 'FAKE NEWS' else 'real' }}">
+        {% if prediction == 'FAKE NEWS' %}⚠ Additional fact-checks and debunking sources
+        {% else %}✓ Additional articles corroborating this story{% endif %}
+      </div>
+      <div class="more-articles-grid">
+        {% for article in more_articles %}
+        <a href="{{ article.link }}" target="_blank" rel="noopener" class="more-article-card {% if article.is_debunk %}more-article-card--debunk{% endif %}">
+          <div class="more-article-img-wrap" data-source="{{ article.source }}"
+            style="position:relative;overflow:hidden;background:#0d1117;"
+            id="mwrap-{{ loop.index }}">
+            <!-- Placeholder base -->
+            <div class="ncard-placeholder" style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;z-index:1;">
+              <span class="ncard-initials">{{ article.initials }}</span>
+              <span class="ncard-source-label">{{ article.source or 'News' }}</span>
+            </div>
+            <!-- Background image div -->
+            <div id="mimg-{{ loop.index }}"
+              style="position:absolute;inset:0;z-index:2;background-size:cover;background-position:center;background-repeat:no-repeat;opacity:0;transition:opacity 0.35s ease;"
+              data-src="{{ article.image }}"
+              data-link="{{ article.link }}"
+              data-title="{{ article.title }}"
+              data-fallback="https://picsum.photos/seed/more{{ loop.index }}/800/450">
+            </div>
+            {% if article.is_debunk %}<span class="more-article-debunk-badge" style="position:relative;z-index:4;">FACT CHECK</span>{% endif %}
+            <div class="more-article-src-chip" style="position:relative;z-index:4;">
+              {% if article.favicon %}<img src="{{ article.favicon }}" alt="" width="11" height="11" onerror="this.style.display='none'" />{% endif %}
+              <span>{{ article.source or 'News' }}</span>
+            </div>
+          </div>
+          <div class="more-article-card-body">
+            <div class="more-article-card-title">{{ article.title }}</div>
+            {% if article.desc %}<div class="more-article-card-desc">{{ article.desc }}</div>{% endif %}
+            <div class="more-article-card-footer">
+              {% if article.published %}<span class="more-article-card-time">🕐 {{ article.published }}</span>{% endif %}
+              <span class="more-article-card-read">Read →</span>
+            </div>
+          </div>
+        </a>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- 9. Verify Further -->
+    <div class="factcheck-section">
+      <div class="section-title">◈ VERIFY FURTHER</div>
+      <div class="factcheck-row">
+        <a href="{{ google_news }}" target="_blank" class="factcheck-btn factcheck-btn--google"><span class="fc-icon">🔍</span><span>Google News</span></a>
+        <a href="{{ snopes }}" target="_blank" class="factcheck-btn factcheck-btn--snopes"><span class="fc-icon">🔎</span><span>Snopes</span></a>
+        <a href="{{ politifact }}" target="_blank" class="factcheck-btn factcheck-btn--pf"><span class="fc-icon">⚖</span><span>PolitiFact</span></a>
+        <a href="{{ altnews }}" target="_blank" class="factcheck-btn factcheck-btn--altnews"><span class="fc-icon">🇮🇳</span><span>AltNews</span></a>
+      </div>
+    </div>
+
+  </section>
+  {% endif %}
+
+  {% if history %}
+  <section class="history-section">
+    <div class="section-title">◈ RECENT SCANS</div>
+    <div class="history-list">
+      {% for item in history %}
+      <div class="history-item history-item--{{ 'fake' if item.label == 'FAKE NEWS' else 'real' }}">
+        <div class="history-badge history-badge--{{ 'fake' if item.label == 'FAKE NEWS' else 'real' }}">
+          {{ '✕' if item.label == 'FAKE NEWS' else '✓' }}
+        </div>
+        <div class="history-text-wrap">
+          <div class="history-text">{{ item.text }}</div>
+          <div class="history-label-tag history-label-tag--{{ 'fake' if item.label == 'FAKE NEWS' else 'real' }}">
+            {{ item.label }}
+          </div>
+        </div>
+        <div class="history-meta">
+          <span class="history-conf">{{ item.confidence }}%</span>
+          <span class="history-time">{{ item.time }}</span>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </section>
+  {% endif %}
+
+</main>
+
+<footer class="footer">
+  <div class="footer-inner">
+    <span class="logo-text-footer">Truth<span class="logo-accent">Lens</span></span>
+    <span class="footer-sep">·</span>
+    <span class="footer-hide-sm">Pattern Scoring · Groq · Cohere · Nitter · Reddit · NewsAPI · Wikipedia · Knowledge Base</span>
+  </div>
+</footer>
+
+<script>
+  /* ── Textarea character counter ─────────────────────────────────── */
+  const ta = document.getElementById('inputText');
+  const cc = document.getElementById('charCount');
+  function updateCount() {
+    const n = ta.value.length;
+    cc.textContent = n + ' / 512';
+    cc.style.color = n > 450 ? '#ff3355' : n > 350 ? '#ffcc00' : '';
+  }
+  ta.addEventListener('input', updateCount);
+  updateCount();
+
+  /* ── Sample loader ──────────────────────────────────────────────── */
+  function loadSample(txt) {
+    ta.value = txt;
+    updateCount();
+    ta.focus();
+    ta.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    ta.style.borderColor = 'var(--accent)';
+    ta.style.boxShadow = '0 0 0 3px var(--accent-dim)';
+    setTimeout(() => { ta.style.borderColor = ''; ta.style.boxShadow = ''; }, 1200);
+    const scanBtn = document.getElementById('scanBtn');
+    const btnText = document.querySelector('.scan-btn-text');
+    btnText.innerHTML = '<span class="scan-icon">✓</span> TEXT LOADED — CLICK TO ANALYSE';
+    scanBtn.style.background = 'linear-gradient(135deg, #00ff88 0%, #00cc6a 100%)';
+    scanBtn.style.color = '#080b10';
+    setTimeout(() => {
+      btnText.innerHTML = '<span class="scan-icon">🔍</span> ANALYSE WITH TRUTHLENS';
+      scanBtn.style.background = '';
+      scanBtn.style.color = '';
+    }, 2000);
+  }
+
+  /* ── Form submit spinner ────────────────────────────────────────── */
+  document.getElementById('scanForm').addEventListener('submit', function() {
+    document.querySelector('.scan-btn-text').style.display = 'none';
+    document.querySelector('.scan-btn-loading').style.display = 'flex';
+    document.getElementById('scanBtn').disabled = true;
+  });
+
+  /* ── Scroll to results ──────────────────────────────────────────── */
+  {% if prediction %}
+  setTimeout(() => document.getElementById('results')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 300);
+  {% endif %}
+
+  /* ══ IMAGE LOADER — server has no internet, browser does the work ══
+     Priority per card:
+       1. data-src (urlToImage from NewsAPI) → load directly
+       2. data-src fails → try allorigins CORS proxy for OG image
+       3. Both fail → data-fallback (smart picsum topic image) always loads
+  ════════════════════════════════════════════════════════════════════ */
+
+  function setBg(el, src) {
+    el.style.backgroundImage = 'url(' + src + ')';
+    el.style.opacity = '1';
+  }
+
+  function extractOgFromHtml(rawHtml) {
+    const ogM = rawHtml.match(/property=["']og:image["'][^>]{0,200}content=["']([^"']{10,})["']/i)
+             || rawHtml.match(/content=["']([^"']{10,})["'][^>]{0,200}property=["']og:image["']/i);
+    if (ogM && ogM[1] && !ogM[1].includes('google')) return ogM[1].trim();
+    const twM = rawHtml.match(/name=["']twitter:image["'][^>]{0,200}content=["']([^"']{10,})["']/i)
+             || rawHtml.match(/content=["']([^"']{10,})["'][^>]{0,200}name=["']twitter:image["']/i);
+    if (twM && twM[1]) return twM[1].trim();
+    return '';
+  }
+
+  function tryProxy(articleUrl, el, fallback) {
+    if (!articleUrl || articleUrl.includes('news.google.com')) {
+      setBg(el, fallback); return;
+    }
+    const proxy = 'https://api.allorigins.win/get?url=' + encodeURIComponent(articleUrl);
+    fetch(proxy, { signal: AbortSignal.timeout(7000) })
+      .then(r => r.ok ? r.json() : Promise.reject())
+      .then(data => {
+        const og = data && data.contents ? extractOgFromHtml(data.contents) : '';
+        if (og) {
+          const img = new Image();
+          img.onload = () => setBg(el, og);
+          img.onerror = () => setBg(el, fallback);
+          img.src = og;
+        } else {
+          setBg(el, fallback);
+        }
+      })
+      .catch(() => setBg(el, fallback));
+  }
+
+  function loadBgImage(el) {
+    const src      = (el.dataset.src      || '').trim();
+    const artUrl   = (el.dataset.link     || '').trim();
+    const fallback = (el.dataset.fallback || '').trim();
+
+    if (src) {
+      const img = new Image();
+      img.onload  = () => setBg(el, src);
+      img.onerror = () => tryProxy(artUrl, el, fallback);
+      img.src = src;
+    } else {
+      tryProxy(artUrl, el, fallback);
+    }
+  }
+
+  /* Run on all image divs after DOM is ready */
+  document.addEventListener('DOMContentLoaded', function() {
+    document.querySelectorAll('[data-src]').forEach(function(el) {
+      loadBgImage(el);
+    });
+  });
+</script>
+</body>
+</html>
