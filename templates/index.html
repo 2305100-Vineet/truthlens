@@ -882,22 +882,80 @@
   }
 
   /* Smart topic fallback — reads article title and picks relevant image */
+  /* ── Topic fallback images — Wikimedia Commons direct URLs ────────
+     These are REAL topic-relevant images, not random stock photos.
+     Multiple URLs per topic — rotated by card index for variety.
+     Wikimedia never blocks hotlinking and images are permanent.
+  ─────────────────────────────────────────────────────────────── */
+  const TOPIC_IMAGES = {
+    war: [
+      'https://upload.wikimedia.org/wikipedia/commons/thumb/4/4f/Kharkiv_after_Russian_bombardment%2C_2022.jpg/800px-Kharkiv_after_Russian_bombardment%2C_2022.jpg',
+      'https://upload.wikimedia.org/wikipedia/commons/thumb/4/49/Flag_of_Ukraine.svg/800px-Flag_of_Ukraine.svg.png',
+      'https://upload.wikimedia.org/wikipedia/commons/thumb/f/f3/Flag_of_Russia.svg/800px-Flag_of_Russia.svg.png',
+      'https://upload.wikimedia.org/wikipedia/commons/thumb/3/37/Flag_of_NATO.svg/800px-Flag_of_NATO.svg.png',
+    ],
+    mideast: [
+      'https://upload.wikimedia.org/wikipedia/commons/thumb/d/d4/Flag_of_Israel.svg/800px-Flag_of_Israel.svg.png',
+      'https://upload.wikimedia.org/wikipedia/commons/thumb/0/00/Flag_of_Palestine.svg/800px-Flag_of_Palestine.svg.png',
+    ],
+    politics: [
+      'https://upload.wikimedia.org/wikipedia/commons/thumb/5/56/Donald_Trump_official_portrait.jpg/800px-Donald_Trump_official_portrait.jpg',
+      'https://upload.wikimedia.org/wikipedia/commons/thumb/1/1a/US_Capitol_Building_at_night_Jan_2006.jpg/800px-US_Capitol_Building_at_night_Jan_2006.jpg',
+      'https://upload.wikimedia.org/wikipedia/commons/thumb/6/68/Joe_Biden_presidential_portrait.jpg/800px-Joe_Biden_presidential_portrait.jpg',
+    ],
+    space: [
+      'https://upload.wikimedia.org/wikipedia/commons/thumb/b/b4/Chandrayaan-3_spacecraft.jpg/800px-Chandrayaan-3_spacecraft.jpg',
+      'https://upload.wikimedia.org/wikipedia/commons/thumb/e/e1/FullMoon2010.jpg/800px-FullMoon2010.jpg',
+      'https://upload.wikimedia.org/wikipedia/commons/thumb/9/9e/Milky_Way_Arch.jpg/800px-Milky_Way_Arch.jpg',
+    ],
+    sports: [
+      'https://upload.wikimedia.org/wikipedia/commons/thumb/5/59/Cricket_pictogram.svg/800px-Cricket_pictogram.svg.png',
+    ],
+    tech: [
+      'https://upload.wikimedia.org/wikipedia/commons/thumb/0/04/ChatGPT_logo.svg/800px-ChatGPT_logo.svg.png',
+      'https://upload.wikimedia.org/wikipedia/commons/thumb/f/fa/Apple_logo_black.svg/800px-Apple_logo_black.svg.png',
+      'https://upload.wikimedia.org/wikipedia/commons/thumb/3/34/Elon_Musk_Royal_Society_%28crop2%29.jpg/800px-Elon_Musk_Royal_Society_%28crop2%29.jpg',
+    ],
+    finance: [
+      'https://upload.wikimedia.org/wikipedia/commons/thumb/4/46/Bitcoin.svg/800px-Bitcoin.svg.png',
+    ],
+    health: [
+      'https://upload.wikimedia.org/wikipedia/commons/thumb/8/82/SARS-CoV-2_without_background.png/800px-SARS-CoV-2_without_background.png',
+    ],
+    climate: [
+      'https://upload.wikimedia.org/wikipedia/commons/thumb/9/97/The_Earth_seen_from_Apollo_17.jpg/800px-The_Earth_seen_from_Apollo_17.jpg',
+    ],
+    factcheck: [
+      'https://upload.wikimedia.org/wikipedia/commons/thumb/3/38/Info_Simple_bw.svg/800px-Info_Simple_bw.svg.png',
+    ],
+    india: [
+      'https://upload.wikimedia.org/wikipedia/commons/thumb/4/41/Flag_of_India.svg/800px-Flag_of_India.svg.png',
+      'https://upload.wikimedia.org/wikipedia/commons/thumb/c/c0/Narendra_Modi_-_2014_%28cropped%29.jpg/800px-Narendra_Modi_-_2014_%28cropped%29.jpg',
+      'https://upload.wikimedia.org/wikipedia/commons/thumb/5/5d/India_-_Delhi_-_039_-_parliament_building_%283982455416%29.jpg/800px-India_-_Delhi_-_039_-_parliament_building_%283982455416%29.jpg',
+    ],
+    news: [
+      'https://upload.wikimedia.org/wikipedia/commons/thumb/1/1a/US_Capitol_Building_at_night_Jan_2006.jpg/800px-US_Capitol_Building_at_night_Jan_2006.jpg',
+      'https://upload.wikimedia.org/wikipedia/commons/thumb/9/97/The_Earth_seen_from_Apollo_17.jpg/800px-The_Earth_seen_from_Apollo_17.jpg',
+      'https://upload.wikimedia.org/wikipedia/commons/thumb/9/9e/Milky_Way_Arch.jpg/800px-Milky_Way_Arch.jpg',
+    ],
+  };
+
   function getTopicFallback(title, index) {
     const t = (title || '').toLowerCase();
-    let base = 'news';
-    if (/ukraine|russia|putin|zelensky|nato|troops|missile|invasion|frontline/.test(t))         base = 'war';
-    else if (/israel|gaza|hamas|palestine/.test(t))                                              base = 'mideast';
-    else if (/trump|biden|kamala|election|president|democrat|republican|capitol|senate/.test(t)) base = 'politics';
-    else if (/isro|chandrayaan|gaganyaan|nasa|space|moon|rocket|satellite|lunar|orbit|spacecraft|astronaut/.test(t)) base = 'space';
-    else if (/cricket|ipl|t20|rohit|kohli|world cup|stadium|olympic|tournament/.test(t))        base = 'sports';
-    else if (/chatgpt|openai|artificial|deepmind|alphafold|tech|google|apple|microsoft|musk|tesla|5g|cyber|digital|software/.test(t)) base = 'tech';
-    else if (/economy|stock|market|bitcoin|crypto|inflation|finance|bank|gdp|budget|sensex|nifty|rupee/.test(t)) base = 'finance';
-    else if (/covid|corona|vaccine|pandemic|virus|health|hospital|doctor|disease|medicine|mpox/.test(t)) base = 'health';
-    else if (/climate|environment|flood|earthquake|cyclone|drought|pollution/.test(t))           base = 'climate';
-    else if (/fake|fact.check|misinformation|debunk|hoax|conspiracy|misleading/.test(t))         base = 'factcheck';
-    else if (/india|modi|delhi|mumbai|bjp|parliament|lok sabha/.test(t))                         base = 'india';
-    const variation = Math.abs(index) % 10;
-    return 'https://picsum.photos/seed/' + base + variation + '/800/450';
+    let topic = 'news';
+    if (/ukraine|russia|putin|zelensky|nato|troops|missile|invasion|frontline|war|conflict/.test(t))         topic = 'war';
+    else if (/israel|gaza|hamas|palestine/.test(t))                                                           topic = 'mideast';
+    else if (/trump|biden|kamala|election|president|democrat|republican|capitol|senate|white house/.test(t))  topic = 'politics';
+    else if (/isro|chandrayaan|gaganyaan|nasa|space|moon|rocket|satellite|lunar|orbit|spacecraft|astronaut/.test(t)) topic = 'space';
+    else if (/cricket|ipl|t20|rohit|kohli|world cup|stadium|olympic|tournament/.test(t))                      topic = 'sports';
+    else if (/chatgpt|openai|artificial|deepmind|alphafold|tech|google|apple|microsoft|musk|tesla|5g|cyber|digital|software/.test(t)) topic = 'tech';
+    else if (/economy|stock|market|bitcoin|crypto|inflation|finance|bank|gdp|budget|sensex|nifty|rupee/.test(t)) topic = 'finance';
+    else if (/covid|corona|vaccine|pandemic|virus|health|hospital|doctor|disease|medicine|mpox/.test(t))       topic = 'health';
+    else if (/climate|environment|flood|earthquake|cyclone|drought|pollution/.test(t))                         topic = 'climate';
+    else if (/fake|fact.check|misinformation|debunk|hoax|conspiracy|misleading/.test(t))                       topic = 'factcheck';
+    else if (/india|modi|delhi|mumbai|bjp|parliament|lok sabha/.test(t))                                       topic = 'india';
+    const arr = TOPIC_IMAGES[topic] || TOPIC_IMAGES.news;
+    return arr[Math.abs(index) % arr.length];
   }
 
   /* ── Reject stock/generic/unrelated images ──────────────────────────
