@@ -5,6 +5,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 import urllib.parse
+from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 import re
@@ -24,9 +25,9 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 scan_history = []
 stats = {"total": 0, "fake": 0, "real": 0}
 
-# ── Thumbnail cache — prevents re-scraping the same URL every request ────────
-THUMBNAIL_CACHE = {}          # url → {"image": str, "ts": float}
-CACHE_EXPIRY_SECONDS = 3600   # 1 hour
+# ── Thumbnail cache ──────────────────────────────────────────────────────────
+THUMBNAIL_CACHE = {}
+CACHE_EXPIRY_SECONDS = 3600  # 1 hour
 
 NEWS_API_KEY      = "74451a00a3da4031907869f3295f3683"
 GOOGLE_FC_API_KEY = "AIzaSyD4rl4NbYwWgaJ35z6P3KI4BUYlFxmZMBs"
@@ -49,7 +50,6 @@ NITTER_INSTANCES = [
     "https://nitter.fdn.fr",
 ]
 
-# ── Hindi news domains for prioritized Indian-language searches ──────────────
 HINDI_NEWS_DOMAINS = (
     "aajtak.in,zeenews.india.com,abplive.com,ndtv.com,ndtv.in,"
     "bhaskar.com,jagran.com,amarujala.com,news18.com,"
@@ -58,7 +58,6 @@ HINDI_NEWS_DOMAINS = (
     "jansatta.com,patrika.com,punjabkesari.in"
 )
 
-# ── Hindi topic → English keyword translation ─────────────────────────────────
 HINDI_TO_ENGLISH_TOPICS = {
     "विश्व कप":      "World Cup cricket",
     "क्रिकेट":       "cricket India",
@@ -499,1391 +498,548 @@ STOPWORDS_EN = {
     "a","an","in","on","at","to","of","is","it","be","as","by","or",
     "do","if","up","so","no","we","my","he","me","us","secretly",
     "launch","launched","announced","confirmed","major","latest",
-    # ── additional weak/generic single words that pollute queries ──
-    "war","world","won","win","wins","beat","beats","beats","south",
+    "war","world","won","win","wins","beat","beats","south",
     "north","east","west","country","nation","state","city","new",
     "election","electoral","college","vote","voting","votes","voters",
-    "presidential","president","prime","minister","minister","cup",
+    "presidential","president","prime","minister","cup",
     "final","finals","match","game","games","team","teams","player",
     "players","says","said","tells","told","man","men","woman","women",
     "first","last","next","top","best","big","biggest","huge","massive",
 }
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ── SECTION: EVENT DETECTION (NEW) ────────────────────────────────────────────
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# ── Event-type detection rules — ordered from most-specific to least ──────────
-# Each rule: (regex, event_type, wiki_template_fn)
-# wiki_template_fn receives (text_lower, year_str) → str wiki topic
-
-EVENT_TYPE_RULES = [
-    # ── US / Global elections ──────────────────────────────────────────────
-    (r'\b(us|u\.s\.|united states|american|presidential)\s+(election|elections|vote|voting)\b',
-     "us_election",
-     lambda t, y: f"2024 United States presidential election" if "2024" in t else
-                  f"United States presidential election"),
-
-    (r'\b(election|elections|vote|voting)\b.{0,40}\b(us|u\.s\.|united states|america|american|trump|biden|harris|kamala)\b',
-     "us_election",
-     lambda t, y: "2024 United States presidential election" if "2024" in t else
-                  "United States presidential election"),
-
-    (r'\b(trump|biden|harris|kamala).{0,40}\b(election|elected|wins|won|president|presidential)\b',
-     "us_election",
-     lambda t, y: "2024 United States presidential election"),
-
-    # ── Indian elections ───────────────────────────────────────────────────
-    (r'\b(india|indian|lok sabha|assembly)\s+(election|elections|vote|voting)\b',
-     "india_election",
-     lambda t, y: "2024 Indian general election" if "2024" in t else "Elections in India"),
-
-    # ── Cricket / T20 / IPL ────────────────────────────────────────────────
-    (r'\b(t20|twenty20|icc|ipl)\s+(world cup|wc|championship)\b',
-     "cricket_t20wc",
-     lambda t, y: "2024 ICC Men's T20 World Cup" if "2024" in t else "ICC Men's T20 World Cup"),
-
-    (r'\b(world cup|wc)\b.{0,30}\b(t20|twenty20|cricket|india|rohit|kohli)\b',
-     "cricket_t20wc",
-     lambda t, y: "2024 ICC Men's T20 World Cup" if "2024" in t else "ICC Men's T20 World Cup"),
-
-    (r'\b(india|rohit sharma|rohit|virat kohli|virat|kohli).{0,40}\b(world cup|wc|t20|icc)\b',
-     "cricket_t20wc",
-     lambda t, y: "2024 ICC Men's T20 World Cup" if "2024" in t else "ICC Men's T20 World Cup"),
-
-    (r'\bipl\b',
-     "cricket_ipl",
-     lambda t, y: "Indian Premier League"),
-
-    # ── Russia-Ukraine war ─────────────────────────────────────────────────
-    # Note: use word-safe patterns — avoid \b before prefix stems like 'invad'
-    (r'\brussia\s+invade[sd]?\s+ukraine|\brussia[n]?\s+invasion\s+of\s+ukraine',
-     "russia_ukraine",
-     lambda t, y: "2022 Russian invasion of Ukraine"),
-
-    (r'\b(?:russia|russian|ukraine|ukrainian|putin|zelensky|zelenskyy)\b.{0,50}\b(?:war|invasion|conflict|troops|missile|offensive)\b',
-     "russia_ukraine",
-     lambda t, y: "2022 Russian invasion of Ukraine"),
-
-    (r'\brussia\s+launch\w*\s+\w+\s+ukraine|\b(?:invasion|war)\b.{0,30}\b(?:russia|ukraine)\b',
-     "russia_ukraine",
-     lambda t, y: "2022 Russian invasion of Ukraine"),
-
-    # ── Hamas/Israel ───────────────────────────────────────────────────────
-    (r'\bhamas\s+attack\w*\b',
-     "hamas_israel",
-     lambda t, y: "2023 Hamas-led attack on Israel"),
-
-    (r'\b(?:hamas|israel|israeli|gaza|palestine|palestinian)\b.{0,40}\b(?:attack(?:ed)?|war|killed|conflict|bomb(?:ed)?|missile)\b',
-     "hamas_israel",
-     lambda t, y: "2023 Hamas-led attack on Israel"),
-
-    (r'\boctober\s+7\b',
-     "hamas_israel",
-     lambda t, y: "2023 Hamas-led attack on Israel"),
-
-    # ── ISRO / Chandrayaan / Space missions ───────────────────────────────
-    (r'\b(chandrayaan|gaganyaan|aditya.?l1|pslv|gslv|isro)\b',
-     "isro_mission",
-     lambda t, y: "Chandrayaan-3" if "chandrayaan" in t else
-                  "Gaganyaan" if "gaganyaan" in t else
-                  "Indian Space Research Organisation"),
-
-    (r'\b(moon landing|lunar landing|moon mission).{0,30}\b(isro|india|chandrayaan)\b',
-     "isro_mission",
-     lambda t, y: "Chandrayaan-3"),
-
-    # ── NASA / Space (generic) ─────────────────────────────────────────────
-    (r'\b(nasa|james webb|hubble|spacex|artemis|iss|space station)\b',
-     "nasa_space",
-     lambda t, y: "NASA" if "nasa" in t else
-                  "James Webb Space Telescope" if "james webb" in t or "webb" in t else
-                  "SpaceX" if "spacex" in t else "NASA"),
-
-    # ── Moon landing conspiracy ────────────────────────────────────────────
-    (r'\b(moon landing).{0,30}\b(fake|faked|hoax|kubrick|conspiracy)\b',
-     "moon_conspiracy",
-     lambda t, y: "Moon landing conspiracy theories"),
-
-    # ── OpenAI / ChatGPT ──────────────────────────────────────────────────
-    (r'\b(chatgpt|openai|gpt.?4|gpt.?3|sam altman)\b',
-     "openai",
-     lambda t, y: "ChatGPT" if "chatgpt" in t else
-                  "Sam Altman" if "sam altman" in t else "OpenAI"),
-
-    # ── Elon Musk / Twitter/X ─────────────────────────────────────────────
-    (r'\b(elon musk|twitter|x\.com).{0,30}\b(bought|acquired|acquisition|renamed|rebranded)\b',
-     "musk_twitter",
-     lambda t, y: "Acquisition of Twitter by Elon Musk"),
-
-    # ── COVID / vaccines ──────────────────────────────────────────────────
-    (r'\b(covid|coronavirus|sars.?cov|pandemic).{0,40}\b(vaccine|microchip|5g|spread|origin)\b',
-     "covid_misinfo",
-     lambda t, y: "COVID-19 vaccine misinformation" if any(w in t for w in ["vaccine","microchip","chip"]) else
-                  "5G conspiracy theories" if "5g" in t else "COVID-19 pandemic"),
-
-    (r'\b(vaccine|vaccination).{0,30}\b(microchip|chip|bill gates|tracking|5g)\b',
-     "vaccine_misinfo",
-     lambda t, y: "COVID-19 vaccine misinformation"),
-
-    # ── Climate change ────────────────────────────────────────────────────
-    (r'\b(climate change|global warming).{0,30}\b(hoax|fake|real|denial|scientific)\b',
-     "climate",
-     lambda t, y: "Climate change denial" if any(w in t for w in ["hoax","fake","denial"]) else "Climate change"),
-
-    # ── Flat earth / conspiracy ───────────────────────────────────────────
-    (r'\b(flat earth|earth is flat)\b',
-     "flat_earth",
-     lambda t, y: "Flat Earth"),
-
-    (r'\b(illuminati|new world order|deep state|chemtrail|reptilian|qanon)\b',
-     "conspiracy",
-     lambda t, y: "Illuminati" if "illuminati" in t else
-                  "New World Order (conspiracy theory)" if "new world order" in t else
-                  "Deep state conspiracy theory" if "deep state" in t else
-                  "Chemtrail conspiracy theory" if "chemtrail" in t else
-                  "Reptilian conspiracy theory" if "reptilian" in t else "QAnon"),
-
-    # ── AlphaFold / DeepMind ──────────────────────────────────────────────
-    (r'\b(alphafold|deepmind|protein folding)\b',
-     "science",
-     lambda t, y: "AlphaFold" if "alphafold" in t else "Google DeepMind"),
-
-    # ── Apple / iPhone ────────────────────────────────────────────────────
-    (r'\b(apple|iphone).{0,30}\b(revenue|record|launched|release|iphone 1[5-9])\b',
-     "apple",
-     lambda t, y: "Apple Inc."),
-
-    # ── India politics ────────────────────────────────────────────────────
-    (r'\b(narendra modi|pm modi|prime minister india|bjp|congress india|lok sabha|parliament india)\b',
-     "india_politics",
-     lambda t, y: "Narendra Modi" if any(w in t for w in ["modi","narendra"]) else
-                  "Bharatiya Janata Party" if "bjp" in t else
-                  "Parliament of India"),
-
-    # ── NEW: Hindi-script direct event detection ──────────────────────────
-    # These fire when the text is in Hindi and contains these exact sequences
-    # ORDER MATTERS: more specific rules must come before generic ones
-
-    (r'(वैक्सीन|टीका).{0,30}(माइक्रोचिप|चिप|बिल गेट्स)',
-     "vaccine_misinfo",
-     lambda t, y: "COVID-19 vaccine misinformation"),
-
-    (r'(5g|5जी).{0,20}(कोरोना|covid|वायरस)',
-     "5g_misinfo",
-     lambda t, y: "5G conspiracy theories"),
-
-    (r'(चंद्रयान|गगनयान|इसरो)',
-     "isro_mission",
-     lambda t, y: "Chandrayaan-3" if "चंद्रयान" in t else
-                  "Gaganyaan" if "गगनयान" in t else
-                  "Indian Space Research Organisation"),
-
-    (r'(विश्व कप|t20 विश्व|आईसीसी)',
-     "cricket_t20wc",
-     lambda t, y: "2024 ICC Men's T20 World Cup" if "2024" in t else "ICC Men's T20 World Cup"),
-
-    (r'(रोहित शर्मा|विराट कोहली|धोनी)',
-     "cricket_t20wc",
-     lambda t, y: "2024 ICC Men's T20 World Cup"),
-
-    (r'(रूस|यूक्रेन|पुतिन)',
-     "russia_ukraine",
-     lambda t, y: "2022 Russian invasion of Ukraine"),
-
-    (r'(चुनाव|election).{0,20}(भारत|india)',
-     "india_election",
-     lambda t, y: "2024 Indian general election" if "2024" in t else "Elections in India"),
-
-    (r'(मोदी|भाजपा|बीजेपी|संसद|लोकसभा)',
-     "india_politics",
-     lambda t, y: "Narendra Modi" if "मोदी" in t else
-                  "Bharatiya Janata Party" if any(w in t for w in ["भाजपा","बीजेपी"]) else
-                  "Parliament of India"),
-
-    (r'(कोरोना|कोविड|covid).{0,30}(वायरस|pandemic|महामारी)',
-     "covid",
-     lambda t, y: "COVID-19 pandemic"),
-
-    (r'(चपटी पृथ्वी|flat earth)',
-     "flat_earth",
-     lambda t, y: "Flat Earth"),
-
-    (r'(इलुमिनाती|illuminati)',
-     "conspiracy",
-     lambda t, y: "Illuminati"),
-]
-
-
-def detect_event_type(text):
-    """
-    NEW: Detect what real-world event category the text refers to.
-    Returns (event_type, wiki_topic) or (None, None).
-    Tries rules in order — most specific first.
-    """
-    t = text.lower()
-    # Extract any 4-digit year present
-    year_match = re.search(r'\b(20\d{2})\b', t)
-    year_str = year_match.group(1) if year_match else ""
-
-    for pattern, etype, wiki_fn in EVENT_TYPE_RULES:
-        if re.search(pattern, t):
-            topic = wiki_fn(t, year_str)
-            return etype, topic
-
-    return None, None
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ── SECTION: IMPROVED KEYWORD EXTRACTION (REWRITTEN) ─────────────────────────
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# ── Known named entities / organizations / people ────────────────────────────
-KNOWN_ENTITIES = [
-    # People
-    "Donald Trump", "Joe Biden", "Kamala Harris", "Barack Obama",
-    "Narendra Modi", "PM Modi", "Rahul Gandhi", "Arvind Kejriwal",
-    "Vladimir Putin", "Volodymyr Zelensky", "Volodymyr Zelenskyy",
-    "Elon Musk", "Bill Gates", "Mark Zuckerberg", "Sam Altman",
-    "Rohit Sharma", "Virat Kohli", "MS Dhoni", "Sachin Tendulkar",
-    "George Soros", "Jeff Bezos", "Sundar Pichai",
-    # Orgs
-    "ISRO", "NASA", "WHO", "UN", "FBI", "CIA", "IMF", "WTO",
-    "OpenAI", "ChatGPT", "DeepMind", "AlphaFold",
-    "Apple", "Google", "Microsoft", "Meta", "Tesla", "Twitter",
-    "BJP", "Congress", "BBC", "Reuters", "CNN", "NDTV",
-    "ICC", "BCCI", "IPL",
-    # Events/places
-    "T20 World Cup", "ICC World Cup", "IPL", "Champions Trophy",
-    "Chandrayaan", "Gaganyaan", "Aditya-L1",
-    "Ukraine", "Russia", "Gaza", "Israel", "Palestine",
-    "Parliament", "Supreme Court", "Lok Sabha", "Rajya Sabha",
-    "White House", "Capitol Hill",
-]
-
-# Compile entity patterns (longest first to prefer multi-word matches)
-_ENTITY_PATTERNS = sorted(
-    [(e, re.compile(r'\b' + re.escape(e) + r'\b', re.IGNORECASE)) for e in KNOWN_ENTITIES],
-    key=lambda x: -len(x[0])
-)
-
-# ── Event phrase patterns — multi-word, high-signal phrases ──────────────────
-EVENT_PHRASE_PATTERNS = [
-    # Elections
-    r'\b(?:us|u\.s\.|united states|american|presidential)\s+election(?:s)?\s*(?:20\d{2})?\b',
-    r'\b(?:lok sabha|assembly|india[n]?)\s+election(?:s)?\s*(?:20\d{2})?\b',
-    r'\b20\d{2}\s+(?:us|indian|presidential|general)\s+election(?:s)?\b',
-    # Cricket events
-    r'\b(?:icc\s+)?t20\s+world\s+cup(?:\s+20\d{2})?\b',
-    r'\b(?:icc\s+)?(?:cricket\s+)?world\s+cup(?:\s+20\d{2})?\b',
-    r'\b(?:india|england|australia)\s+(?:vs?\.?|versus)\s+(?:india|england|australia|south africa|pakistan|new zealand)\b',
-    r'\bipl\s+(?:20\d{2}|season\s+\d+|final)?\b',
-    # Wars / conflicts
-    r'\brussia[n]?\s+invasion\s+of\s+ukraine\b',
-    r'\brussia[n]?\s*[-–]\s*ukraine\s+war\b',
-    r'\brussia\s+(?:invades?|invaded|launches?)\s+ukraine\b',
-    r'\bhamas\s+attack(?:ed|s)?\s+(?:on\s+)?israel\b',
-    r'\boctober\s+7\s+(?:attack|massacre|hamas)\b',
-    # Space missions
-    r'\bchandrayaan[- ]?(?:3|three|2|two|1|one)?\b',
-    r'\bgaganyaan\s+(?:mission|launch|crew)?\b',
-    r'\bisro\s+(?:launch(?:es?|ed)?|mission|satellite)\b',
-    r'\bnasa\s+(?:artemis|james\s+webb|moon|mars|launch)\b',
-    # AI/Tech
-    r'\b(?:openai|chatgpt)\s+(?:users?|weekly|monthly|launch(?:es?)?\b)',
-    r'\belon\s+musk\s+(?:buys?|bought|acquires?|acquired|twitter|x\.com)\b',
-    r'\bapple\s+(?:iphone\s+\d+|revenue|record|launch(?:es?|ed)?)\b',
-    # Moon landing conspiracy
-    r'\bmoon\s+landing\s+(?:fake|faked|hoax|conspiracy)\b',
-    r'\bapollo\s+(?:11|program)\s+(?:fake|faked|hoax)?\b',
-    # COVID / vaccine conspiracy
-    r'\bvaccine\s+(?:microchip|chip|tracking|5g|bill\s+gates)\b',
-    r'\b5g\s+(?:towers?|network)\s+(?:spread|cause[sd]?|linked)\s+(?:covid|coronavirus|cancer)\b',
-    r'\bcovid\s*[-–]?\s*19\s+(?:pandemic|vaccine|origin|lab)\b',
-]
-
-_EVENT_PHRASE_COMPILED = [re.compile(p, re.IGNORECASE) for p in EVENT_PHRASE_PATTERNS]
-
-
-def extract_event_phrases(text):
-    """
-    NEW: Extract multi-word event phrases from text.
-    These are high-signal, context-rich phrases.
-    Returns list of matched phrase strings, deduped, longest first.
-    """
-    found = []
-    seen = set()
-    for pat in _EVENT_PHRASE_COMPILED:
-        m = pat.search(text)
-        if m:
-            phrase = m.group(0).strip()
-            pl = phrase.lower()
-            if pl not in seen:
-                seen.add(pl)
-                found.append(phrase)
-    # Sort longest first
-    return sorted(found, key=len, reverse=True)
-
-
-def extract_known_entities(text):
-    """
-    NEW: Extract known named entities from text using compiled regex patterns.
-    Returns list of matched entity strings, deduped, longest first.
-    """
-    found = []
-    seen = set()
-    for entity, pat in _ENTITY_PATTERNS:
-        if pat.search(text):
-            el = entity.lower()
-            if el not in seen:
-                seen.add(el)
-                found.append(entity)
-    return found
-
-
-def extract_named_entities(text):
-    """
-    IMPROVED: Extract named entities with better filtering.
-    Combines known-entity matching, capitalized proper noun detection,
-    and Hindi sequence extraction.
-    """
-    # Start with known entities (high confidence)
-    entities = extract_known_entities(text)
-
-    # Add capitalized proper nouns not already covered
-    en_caps = re.findall(r'\b([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,}){0,3})\b', text)
-    seen = set(e.lower() for e in entities)
-    for e in en_caps:
-        el = e.lower()
-        if el not in seen and el not in STOPWORDS_EN and len(el) > 3:
-            # Skip single generic words that slipped through capitalization
-            words = el.split()
-            if len(words) > 1 or (len(words) == 1 and len(words[0]) > 5):
-                seen.add(el)
-                entities.append(e)
-
-    # Hindi named entity sequences
-    hi_seqs = re.findall(r'[\u0900-\u097F]+(?:\s+[\u0900-\u097F]+)*', text)
-    for seq in hi_seqs:
-        if len(seq) > 3:
-            entities.append(seq)
-
-    # Dedup preserving order, longest first
-    seen2 = set()
-    result = []
-    for e in sorted(entities, key=len, reverse=True):
-        el = e.lower()
-        if el not in seen2:
-            seen2.add(el)
-            result.append(e)
-    return result
-
-
-def extract_year(text):
-    """Extract a 4-digit year from text if present."""
-    m = re.search(r'\b(20\d{2}|19\d{2})\b', text)
-    return m.group(1) if m else ""
-
-
-def extract_keywords(text):
-    """
-    IMPROVED: Context-aware keyword extraction.
-    Priority: event phrases > known entities > capitalized nouns > filtered single words.
-    Returns 3-8 high-quality keywords.
-    """
-    # 1. Event phrases (highest priority — multi-word, high signal)
-    event_phrases = extract_event_phrases(text)
-
-    # 2. Known entities
-    entities = extract_known_entities(text)
-
-    # 3. Capitalized proper nouns (not already captured)
-    caps_nouns = []
-    seen = set(e.lower() for e in event_phrases + entities)
-    for e in re.findall(r'\b([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,}){0,2})\b', text):
-        el = e.lower()
-        if el not in seen and el not in STOPWORDS_EN and len(el) > 3:
-            seen.add(el)
-            caps_nouns.append(e)
-
-    # 4. Year if present
-    year = extract_year(text)
-
-    # 5. Hindi words
-    hi_words = re.findall(r'[\u0900-\u097F]{3,}', text)
-    stopwords_hi = {
-        "और","में","की","के","को","से","है","हैं","था","थी","थे","कि","यह",
-        "वह","इस","उस","जो","पर","भी","तो","हो","ने","एक","एवं","लेकिन",
-    }
-    hi_filtered = [w for w in hi_words if w not in stopwords_hi][:4]
-
-    # 6. Fallback: meaningful single English words
-    single_words = []
-    all_seen = set(e.lower() for e in event_phrases + entities + caps_nouns)
-    for w in re.findall(r'\b[a-zA-Z]{4,}\b', text):
-        wl = w.lower()
-        if wl not in STOPWORDS_EN and wl not in all_seen and len(wl) > 3:
-            all_seen.add(wl)
-            single_words.append(w)
-
-    # Combine in priority order
-    combined = event_phrases[:2] + entities[:3] + caps_nouns[:2]
-    if year and year not in " ".join(combined):
-        combined.append(year)
-    combined += hi_filtered
-    combined += single_words[:max(0, 6 - len(combined))]
-
-    # Dedup final list
-    seen_final = set()
-    result = []
-    for kw in combined:
-        kl = kw.lower().strip()
-        if kl and kl not in seen_final:
-            seen_final.add(kl)
-            result.append(kw)
-
-    return result[:10]
-
-
-def extract_newsapi_keywords(text):
-    """
-    Build precise, context-aware keywords for NewsAPI queries.
-    Priority: named persons → named orgs → year → event phrase → event wiki terms.
-    Returns a list of up to 5 terms ordered by relevance signal strength.
-    """
-    # For Hindi text: translate first, then extract from translated version too
-    hi_translated = ""
-    if is_hindi(text):
-        hi_kw = _hindi_to_english_keywords(text)
-        hi_translated = " ".join(hi_kw)
-
-    # Run event detection on both original and translated text
-    work_text       = hi_translated if hi_translated else text
-    year            = extract_year(text) or extract_year(hi_translated)
-    _, event_wiki   = detect_event_type(work_text) or detect_event_type(text)
-    entities        = extract_known_entities(work_text) or extract_known_entities(text)
-    event_phrases   = extract_event_phrases(work_text) or extract_event_phrases(text)
-
-    _people_set    = {x.lower() for x in KNOWN_ENTITIES[:22]}
-    persons        = [e for e in entities if e.lower() in _people_set]
-    orgs           = [e for e in entities if e.lower() not in _people_set]
-
-    def _first_pos(lst, ref_text):
-        tl = ref_text.lower()
-        best_e, best_p = None, len(ref_text) + 1
-        for e in lst:
-            p = tl.find(e.lower())
-            if p != -1 and p < best_p:
-                best_p = p; best_e = e
-        return best_e
-
-    primary_person = _first_pos(persons, work_text)
-    primary_org    = _first_pos(orgs, work_text)
-    second_person  = next((e for e in persons if e != primary_person), None)
-    second_org     = next((e for e in orgs   if e != primary_org),    None)
-
-    parts = []
-    seen  = set()
-
-    def _add(s):
-        sl = (s or "").strip().lower()
-        if sl and sl not in seen and len(sl) > 1:
-            seen.add(sl); parts.append(s.strip())
-
-    _add(primary_person)   # e.g. "Donald Trump"
-    _add(second_person)    # e.g. "Kamala Harris"
-    _add(primary_org)      # e.g. "ISRO", "Ukraine"
-    _add(second_org)       # e.g. "Russia"
-    _add(year)             # e.g. "2024"
-
-    # Best event phrase — deduplicated against already-added parts
-    # Only add if it contributes NEW words not already in parts
-    if event_phrases:
-        ep = event_phrases[0]
-        ep_words = ep.split()[:4]
-        new_ep_words = [w for w in ep_words if w.lower() not in seen]
-        if new_ep_words:
-            frag = " ".join(new_ep_words)
-            _add(frag)
-
-    # Event wiki key terms as fallback
-    if not event_phrases and event_wiki:
-        skip_ew = {"the","a","an","of","by","in","on","at","and","or",
-                   "conspiracy","misinformation","theories","theory","denial"}
-        ew_words = [w for w in event_wiki.split() if w.lower() not in skip_ew][:3]
-        for w in ew_words:
-            _add(w)
-
-    # Final fallback: meaningful single words from the text
-    if len(parts) < 2:
-        for w in re.findall(r'\b[a-zA-Z]{4,}\b', work_text or text):
-            if len(parts) >= 4:
-                break
-            wl = w.lower()
-            if wl not in STOPWORDS_EN and wl not in seen:
-                seen.add(wl); parts.append(w)
-
-    return parts[:5]
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ── SECTION: IMPROVED WIKIPEDIA TOPIC RESOLUTION (REWRITTEN) ─────────────────
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def resolve_wiki_topic(claim_keywords, text):
-    """
-    UPDATED: Strict priority — EVENT first, then long phrase, then first-mentioned entity.
-
-    Priority order:
-    1. detect_event_type() — always wins if it fires (event > any entity)
-    2. Hindi WIKI_TOPIC_MAP keys — direct script match
-    3. WIKI_TOPIC_MAP phrase matching — scored by LENGTH (longer = more specific)
-       Multi-word phrases (≥3 words) beat single words by design.
-       Only the FIRST-MENTIONED entity in text is used when multiple exist.
-    4. Known entity fallback (first-mentioned only)
-    5. Keyword fallback
-    Returns "" only when nothing at all matches (caller should add its own fallback).
-    """
-    text_lower = text.lower()
-
-    # ── Step 1: Event detection — ALWAYS wins ────────────────────────────
-    # This covers: US election, T20 World Cup, Russia-Ukraine, ISRO, etc.
-    event_type, event_wiki = detect_event_type(text)
-    if event_wiki:
-        return event_wiki
-
-    # ── Step 2: Hindi WIKI_TOPIC_MAP keys — direct Unicode match ─────────
-    text_clean    = re.sub(r'[^\w\s]', ' ', text_lower)
-    words_in_text = set(text_clean.split())
-
-    best_topic = ""
-    best_score = 0.0
-
-    for key, topic in WIKI_TOPIC_MAP.items():
-        if any('\u0900' <= c <= '\u097F' for c in key):
-            if key in text:
-                score = 2.0 + len(key) * 0.05   # Hindi direct match scores high
-                if score > best_score:
-                    best_score = score
-                    best_topic = topic
-            continue
-
-        key_words = key.split()
-        key_len   = len(key_words)
-
-        matched = sum(1 for w in key_words if w in words_in_text)
-        if matched == 0:
-            continue
-
-        match_ratio = matched / key_len
-
-        # Stricter minimum: require higher coverage for longer keys
-        min_ratio = 0.6 if key_len <= 2 else 0.7 if key_len <= 4 else 0.80
-        if match_ratio < min_ratio:
-            continue
-
-        # ── Scoring: LENGTH is the dominant signal ────────────────────────
-        # A 4-word key like "trump won 2024 election" must beat "kamala harris"
-        # Formula:
-        #   base          = match_ratio
-        #   length_bonus  = key_len * 0.25   (longer → much higher)
-        #   full_bonus    = 0.80 if all words matched
-        #   single_penalty= -0.40 for single-word keys (too generic)
-        length_bonus    = key_len * 0.25
-        full_bonus      = 0.80 if match_ratio == 1.0 else 0.0
-        single_penalty  = -0.40 if key_len == 1 else 0.0
-
-        # ── First-mention bonus: prefer topics whose key words appear EARLY ─
-        # Find position of first key word in text
-        positions = [text_lower.find(w) for w in key_words if w in text_lower]
-        if positions:
-            earliest = min(p for p in positions if p >= 0)
-            # Score boost for words near start of text (position 0–50 chars)
-            position_bonus = max(0.0, (200 - earliest) / 200) * 0.30
-        else:
-            position_bonus = 0.0
-
-        score = match_ratio + length_bonus + full_bonus + single_penalty + position_bonus
-
-        if score > best_score:
-            best_score = score
-            best_topic = topic
-
-    if best_topic:
-        return best_topic
-
-    # ── Step 3: First-mentioned entity only (not all entities) ───────────
-    # "Trump wins election defeating Kamala Harris" → Trump is first → use Trump
-    entities = extract_known_entities(text)
-    if entities:
-        def _pos(e):
-            p = text_lower.find(e.lower())
-            return p if p >= 0 else len(text)
-        # Sort by position in text — take earliest mentioned
-        entities_sorted = sorted(entities, key=_pos)
-        for entity in entities_sorted[:2]:   # try top-2 by position
-            el = entity.lower()
-            if el in WIKI_TOPIC_MAP:
-                return WIKI_TOPIC_MAP[el]
-            for key, topic in WIKI_TOPIC_MAP.items():
-                if el in key or key in el:
-                    return topic
-
-    # ── Step 4: Keyword fallback ──────────────────────────────────────────
-    if claim_keywords:
-        for kw in claim_keywords[:3]:
-            kl = kw.lower()
-            if kl in WIKI_TOPIC_MAP:
-                return WIKI_TOPIC_MAP[kl]
-
-    return ""
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ── SECTION: TWITTER QUERY GENERATION (NEW) ───────────────────────────────────
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def generate_twitter_query(text, all_keywords, prediction):
-    """
-    Generates 5 focused, deduplicated, news-specific Twitter search queries.
-
-    Strategy:
-    1. Use detect_event_type() to identify the event category first
-    2. Extract ALL relevant entities + year from the text
-    3. Build 5 distinct queries covering: primary person, event phrase,
-       person+year, event+year, and a broad topic fallback
-    4. For FAKE NEWS: mix in "fact check" / "debunked" variants
-    5. Deduplicate words within each query
-    6. Never use generic words like "war", "world", "election" alone
-    """
-    t_lower = text.lower()
-    year    = extract_year(text)
-
-    # ── Step 1: Event detection ───────────────────────────────────────────
-    event_type, event_wiki = detect_event_type(text)
-
-    # ── Step 2: Extract all entities and event phrases ────────────────────
-    all_entities   = extract_known_entities(text)
-    event_phrases  = extract_event_phrases(text)
-
-    # Separate people from orgs/places — use full KNOWN_ENTITIES index
-    _people_set = {x.lower() for x in KNOWN_ENTITIES[:22]}  # index 0-21 = people
-    persons    = [e for e in all_entities if e.lower() in _people_set]
-    orgs       = [e for e in all_entities if e.lower() not in _people_set]
-
-    # ── Step 3: Determine PRIMARY subject and EVENT CONTEXT ───────────────
-    # Primary = the most important person/entity in the story
-    # For "Trump wins election", primary = "Donald Trump", NOT "Kamala Harris"
-    # Strategy: pick the FIRST entity mentioned in text (subject position)
-
-    def _first_mentioned(entity_list):
-        """Return entity that appears earliest in the original text."""
-        best_e, best_pos = None, len(text) + 1
-        for e in entity_list:
-            pos = t_lower.find(e.lower())
-            if pos != -1 and pos < best_pos:
-                best_pos = pos
-                best_e = e
-        return best_e
-
-    primary_person = _first_mentioned(persons)   # e.g. "Donald Trump"
-    primary_org    = _first_mentioned(orgs)       # e.g. "Ukraine", "ISRO"
-    primary        = primary_person or primary_org or ""
-
-    # Event context: best event phrase > event_wiki keywords > nothing
-    event_ctx = ""
-    if event_phrases:
-        event_ctx = event_phrases[0]
-    elif event_wiki:
-        wiki_words = [w for w in event_wiki.split()
-                      if w.lower() not in {"the","a","an","of","by","in","on","at","and","or"}]
-        event_ctx = " ".join(wiki_words[:5])
-
-    # When no known entity was found, fall back to event_wiki words as primary
-    # e.g. "5G COVID-19 misinformation" → primary = "5G COVID-19"
-    if not primary and event_wiki:
-        wiki_words = [w for w in event_wiki.split()
-                      if w.lower() not in {"the","a","an","of","by","in","on","at","and","or"}]
-        primary = " ".join(wiki_words[:3])
-
-    # When STILL no primary, pull top keyword from all_keywords
-    if not primary and all_keywords:
-        en_kw = [k for k in all_keywords if all(ord(c) < 128 for c in k)]
-        primary = " ".join(en_kw[:2])
-
-    # Second person/entity for paired queries (e.g. Putin + Zelensky, Trump + Harris)
-    second_person = next((e for e in persons if e != primary_person), None)
-    second_org    = next((e for e in orgs   if e != primary_org),    None)
-
-    # ── Step 4: Build dedup helper ────────────────────────────────────────
-    def _dedup(*parts):
-        seen_w = set()
-        out    = []
-        for part in parts:
-            if not part:
-                continue
-            for w in part.split():
-                if w.lower() not in seen_w:
-                    seen_w.add(w.lower())
-                    out.append(w)
-        return " ".join(out).strip()
-
-    # ── Step 5: Build 5–7 distinct queries ───────────────────────────────
-    raw_queries = []
-
-    # Q1 — Most specific: primary subject + event context + year
-    q1 = _dedup(primary, event_ctx, year)
-    raw_queries.append(q1)
-
-    # Q2 — Primary + year only (clean, shorter variant)
-    if primary and year:
-        raw_queries.append(_dedup(primary, year))
-    elif primary and second_person:
-        raw_queries.append(_dedup(primary, second_person))
-    elif primary:
-        raw_queries.append(primary)
-
-    # Q3 — Event context + year (broader, no specific person)
-    # Use event_wiki directly if it's more descriptive than event_ctx
-    if event_wiki and year:
-        q3_base = event_wiki[:50]
-        raw_queries.append(_dedup(q3_base, year))
-    elif event_ctx and year:
-        raw_queries.append(_dedup(event_ctx, year))
-    elif event_ctx:
-        raw_queries.append(event_ctx)
-
-    # Q4 — Second entity paired with event/year (different angle)
-    if second_person:
-        raw_queries.append(_dedup(second_person, event_ctx or year))
-    elif second_org and second_org != primary_org:
-        raw_queries.append(_dedup(second_org, year or event_ctx))
-    elif primary_org and primary_person:
-        raw_queries.append(_dedup(primary_org, year))
-
-    # Q5/Q6 — Prediction-specific variants
-    if prediction == "FAKE NEWS":
-        raw_queries.append(_dedup(primary or event_ctx, "fact check"))
-        raw_queries.append(_dedup(primary or event_ctx, "debunked misinformation"))
-    else:
-        # All entities together
-        raw_queries.append(_dedup(primary, second_person or second_org or primary_org, year))
-        # Full event wiki topic as its own search
-        if event_wiki:
-            raw_queries.append(event_wiki[:60])
-
-    # ── Step 6: Deduplicate queries, remove empties, ensure minimum ───────
-    seen_q  = set()
-    queries = []
-    for q in raw_queries:
-        q = q.strip()
-        if not q or len(q) < 4:
-            continue
-        ql = q.lower()
-        if ql in seen_q:
-            continue
-        # Skip queries that are just a year alone
-        if re.fullmatch(r"20\d{2}", q):
-            continue
-        seen_q.add(ql)
-        queries.append(q)
-
-    # Final fallback: use best all_keywords
-    if not queries:
-        kw_en = [k for k in all_keywords if all(ord(c) < 128 for c in k)][:4]
-        queries = [_dedup(*kw_en[:3]), _dedup(*kw_en[:2])]
-        queries = [q for q in queries if q]
-
-    return queries[:7]  # Return up to 7 for Nitter to use
-
-
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ── SECTION: CORE SCORING ENGINE (unchanged) ──────────────────────────────────
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def score_claim(text):
-    text_lower = text.lower()
-    text_clean = re.sub(r'[^\w\s]', ' ', text_lower)
-
-    kb_real = check_verified_event(text)
-    kb_fake = check_misinformation_kb(text)
-
-    if kb_real and kb_real[2] >= 0.75:
-        real_score = min(95, 70 + round(kb_real[2] * 25))
-        return "REAL NEWS", 100 - real_score, real_score, kb_real, kb_fake
-
-    if kb_fake and kb_fake[2] >= 0.75:
-        fake_score = min(95, 70 + round(kb_fake[2] * 25))
-        return "FAKE NEWS", fake_score, 100 - fake_score, kb_real, kb_fake
-
-    strong_fake_hits = sum(1 for p in STRONG_FAKE_SIGNALS if re.search(p, text_lower))
-    strong_real_hits = sum(1 for p in STRONG_REAL_SIGNALS if re.search(p, text_lower))
-
-    suspicious_hits = sum(1 for p, _ in SUSPICIOUS_PATTERNS if re.search(p, text_lower))
-    credible_hits   = sum(1 for p, _ in CREDIBLE_PATTERNS   if re.search(p, text_lower))
-
-    fake_raw = 50
-    fake_raw += strong_fake_hits * 22
-    fake_raw -= strong_real_hits * 18
-    fake_raw += suspicious_hits * 8
-    fake_raw -= credible_hits * 7
-
-    abs_claims = len(re.findall(r'\b(100%|proven|guaranteed|banned|suppressed|secret|exposed|shocking)\b', text_lower))
-    fake_raw += abs_claims * 5
-
-    caps_words = len(re.findall(r'\b[A-Z]{4,}\b', text))
-    fake_raw += min(caps_words * 3, 15)
-
-    word_count = len(text.split())
-    if word_count < 8:
-        fake_raw += 5
-
-    fake_raw = max(5, min(95, fake_raw))
-    real_raw = 100 - fake_raw
-
-    label = "FAKE NEWS" if fake_raw > 50 else "REAL NEWS"
-
-    if kb_real and kb_real[2] >= 0.6:
-        if label == "FAKE NEWS" and fake_raw < 85:
-            label = "REAL NEWS"
-            real_raw = max(real_raw, 65)
-            fake_raw = 100 - real_raw
-    if kb_fake and kb_fake[2] >= 0.6:
-        if label == "REAL NEWS" and real_raw < 85:
-            label = "FAKE NEWS"
-            fake_raw = max(fake_raw, 65)
-            real_raw = 100 - fake_raw
-
-    return label, fake_raw, real_raw, kb_real, kb_fake
-
-
-# ─── Knowledge Base Matching ───────────────────────────────────────────────────
-
-def check_verified_event(text):
-    text_lower = text.lower()
-    text_clean = re.sub(r'[^\w\s]', ' ', text_lower)
-    best_match = None
-    best_score = 0
-    for phrase, label, description in VERIFIED_EVENTS_KB:
-        words = phrase.split()
-        matched = sum(1 for w in words if w in text_clean)
-        score = matched / len(words)
-        if score > best_score and score >= 0.6:
-            best_score = score
-            best_match = (description, label, score)
-    return best_match
-
-def check_misinformation_kb(text):
-    text_lower = text.lower()
-    text_clean = re.sub(r'[^\w\s]', ' ', text_lower)
-    best_match = None
-    best_score = 0
-    for phrase, label, description in KNOWN_MISINFORMATION_KB:
-        words = phrase.split()
-        matched = sum(1 for w in words if w in text_clean)
-        score = matched / len(words)
-        if score > best_score and score >= 0.65:
-            best_score = score
-            best_match = (description, label, score)
-    return best_match
-
-
-# ─── Helpers ──────────────────────────────────────────────────────────────────
-
-def get_source_favicon(source_name):
-    if not source_name:
-        return ""
-    key = source_name.lower().strip()
-    if key in SOURCE_FAVICONS:
-        return SOURCE_FAVICONS[key]
-    for known, fav in SOURCE_FAVICONS.items():
-        if known in key or key in known:
-            return fav
-    domain = re.sub(r'[^a-z0-9]', '', key)
-    return f"https://www.google.com/s2/favicons?domain={domain}.com&sz=32"
-
-def get_source_initials(source_name):
-    if not source_name:
-        return "N"
-    words = source_name.strip().split()
-    if len(words) == 1:
-        return words[0][:2].upper()
-    return (words[0][0] + words[1][0]).upper()
-
-
-# ─── Thumbnail extraction helpers ─────────────────────────────────────────────
-
-def _extract_og_image_from_html(html):
-    SKIP_PATTERNS = [
-        'logo', 'icon', 'sprite', 'favicon', 'avatar', 'placeholder',
-        'blank', 'pixel', 'spacer', 'badge', 'button', 'profile',
-        'default-image', 'no-image', 'noimage', 'missing',
-    ]
-
-    def _is_valid(src):
-        if not src:
-            return False
-        src = src.strip()
-        if not src.startswith(("http://", "https://", "//")):
-            return False
-        sl = src.lower()
-        if sl.endswith(".svg") or ".svg?" in sl or ".svg#" in sl:
-            return False
-        if any(skip in sl for skip in SKIP_PATTERNS):
-            return False
-        dm = re.search(r'[/_\-](\d{1,3})x(\d{1,3})[/_\-.]', src)
-        if dm:
-            w, h = int(dm.group(1)), int(dm.group(2))
-            if w < 200 or h < 150:
-                return False
-        return True
-
-    try:
-        _soup = BeautifulSoup(html, "html.parser")
-        for _prop, _names in [
-            ("og:image:secure_url", []),
-            ("og:image",            []),
-        ]:
-            _tag = _soup.find("meta", property=_prop)
-            if _tag and _is_valid((_tag.get("content") or "").strip()):
-                return (_tag.get("content") or "").strip()
-        for _name in ["twitter:image:src", "twitter:image"]:
-            _tag = _soup.find("meta", attrs={"name": _name})
-            if _tag and _is_valid((_tag.get("content") or "").strip()):
-                return (_tag.get("content") or "").strip()
-    except Exception:
-        pass
-
-    patterns = [
-        r'property=["\']og:image:secure_url["\'][^>]{0,300}content=["\']([^"\']{10,})["\']',
-        r'content=["\']([^"\']{10,})["\'][^>]{0,300}property=["\']og:image:secure_url["\']',
-        r'property=["\']og:image["\'][^>]{0,300}content=["\']([^"\']{10,})["\']',
-        r'content=["\']([^"\']{10,})["\'][^>]{0,300}property=["\']og:image["\']',
-        r'name=["\']twitter:image:src["\'][^>]{0,300}content=["\']([^"\']{10,})["\']',
-        r'content=["\']([^"\']{10,})["\'][^>]{0,300}name=["\']twitter:image:src["\']',
-        r'name=["\']twitter:image["\'][^>]{0,300}content=["\']([^"\']{10,})["\']',
-        r'content=["\']([^"\']{10,})["\'][^>]{0,300}name=["\']twitter:image["\']',
-        r'itemprop=["\']image["\'][^>]{0,300}content=["\']([^"\']{10,})["\']',
-        r'content=["\']([^"\']{10,})["\'][^>]{0,300}itemprop=["\']image["\']',
-    ]
-
-    for pat in patterns:
-        m = re.search(pat, html, re.I | re.S)
-        if m:
-            src = m.group(1).strip()
-            if _is_valid(src):
-                return src
-
-    try:
-        soup = BeautifulSoup(html, "html.parser")
-        container = (
-            soup.find("article") or
-            soup.find("main") or
-            soup.find(id=re.compile(r"(content|article|story|body)", re.I)) or
-            soup.find(class_=re.compile(r"(content|article|story|body)", re.I)) or
-            soup.body or
-            soup
-        )
-        ARTICLE_HINTS = ("news", "article", "media", "photo", "image",
-                         "upload", "cdn", "content", "story", "img")
-        best_candidate = ""
-        for img in (container.find_all("img") if container else []):
-            src = (img.get("src") or
-                   img.get("data-src") or
-                   img.get("data-lazy-src") or
-                   img.get("data-original") or
-                   (img.get("srcset") or "").split()[0])
-            if not src:
-                continue
-            if src.startswith("//"):
-                src = "https:" + src
-            if not _is_valid(src):
-                continue
-            try:
-                w = int(img.get("width") or 0)
-                h = int(img.get("height") or 0)
-                if (w and w < 300) or (h and h < 200):
-                    continue
-            except (ValueError, TypeError):
-                pass
-            if any(hint in src.lower() for hint in ARTICLE_HINTS):
-                return src
-            if not best_candidate:
-                best_candidate = src
-        if best_candidate:
-            return best_candidate
-    except Exception:
-        pass
-
-    return ""
-
-
-def _resolve_real_url(url):
-    if not url or not url.startswith("http"):
-        return url
-
-    REDIRECT_HOSTS = ("news.google.com", "t.co", "bit.ly", "ow.ly",
-                      "tinyurl.com", "buff.ly", "dlvr.it")
-    try:
-        host = urllib.parse.urlparse(url).netloc.lower()
-    except Exception:
-        host = ""
-
-    if not any(h in host for h in REDIRECT_HOSTS):
-        return url
-
-    cached = THUMBNAIL_CACHE.get("__url__" + url)
-    if cached and (time.time() - cached["ts"]) < CACHE_EXPIRY_SECONDS:
-        return cached["image"] or url
-
-    try:
-        r = requests.get(
-            url,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-                "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
-            },
-            allow_redirects=True,
-            timeout=5,
-        )
-        final = r.url
-        if final and "news.google.com" not in final and final.startswith("http"):
-            THUMBNAIL_CACHE["__url__" + url] = {"image": final, "ts": time.time()}
-            return final
-    except Exception:
-        pass
-
-    return url
-
-
-_ICON_URL_FRAGMENTS = [
-    "news.google.com",
-    "google.com/s2",
-    "lh3.googleusercontent.com",
-    "lh4.googleusercontent.com",
-    "lh5.googleusercontent.com",
-    "lh6.googleusercontent.com",
-    "encrypted-tbn",
-    "news_icon",
-    "app-icon",
-    "apple-touch-icon",
-    "social-icon",
-    "site-icon",
-    "brand-logo",
-    "/icon",
-    "/logo",
-]
-
-_GOOGLE_NEWS_ICON_SIGNATURES = [
-    "CBMi",
-    "w=48", "w=32", "w=16",
-    "h=48", "h=32", "h=16",
-    "size=48", "size=32", "size=16",
-]
-
-
-def _is_clean_image(url):
-    if not url or not isinstance(url, str):
-        return False
-    url = url.strip()
-    if not url.startswith("http"):
-        return False
-    ul = url.lower()
-    BAD = [
-        "favicon", "sprite", "1x1", "pixel", "spacer",
-        "tracking", "beacon", "news.google.com", "google.com/s2",
-    ]
-    if any(b in ul for b in BAD):
-        return False
-    return True
-
-
-# Domains known to serve generic/unrelated stock images as OG images
-# For these, we skip scraping and go straight to fallback
-_STOCK_IMAGE_DOMAINS = {
-    "sanskriiti.com", "sanskriti.com", "affairscloud.com",
-    "gktoday.in", "currentaffairs.gktoday.in",
-    "jagranjosh.com", "testbook.com", "byjus.com",
-    "adda247.com", "oliveboard.in", "gradupgradation.com",
-    "examsdaily.in", "bankersadda.com", "sscadda.com",
-    "currentaffairs4u.com", "careermantra.net",
-    # These serve random Unsplash/Pexels stock via CDN
-    "images.unsplash.com", "cdn.pixabay.com",
-    "stock.adobe.com", "shutterstock.com", "istockphoto.com",
-    "gettyimages.com",
+# ─────────────────────────────────────────────────────────────────────────────
+# ══ ROBUST THUMBNAIL EXTRACTION SYSTEM ══════════════════════════════════════
+# Priority: og:image/og:image:secure_url → twitter:image → JSON-LD → largest img
+# ─────────────────────────────────────────────────────────────────────────────
+
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "DNT": "1",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
 }
 
-# URL path fragments that strongly indicate a stock/generic image
-_STOCK_URL_FRAGMENTS = [
-    "unsplash.com/photo", "pixabay.com/photos",
-    "pexels.com/photo", "istockphoto.com/photo",
-    "shutterstock.com/image", "gettyimages.com/photos",
-    "stock-photo", "stock_photo", "stockphoto",
-    "/generic/", "/placeholder/", "/default-",
-    "wp-content/uploads/banner", "wp-content/uploads/logo",
-    "wp-content/uploads/header", "wp-content/uploads/bg",
-    "wp-content/uploads/background",
+# Patterns in image URLs/alt text indicating non-article images
+_SKIP_PATTERNS = [
+    'logo', 'icon', 'sprite', 'favicon', 'avatar', 'placeholder',
+    'blank', 'pixel', 'spacer', 'badge', 'button', 'profile',
+    'default-image', 'no-image', 'noimage', 'missing', 'author',
+    'generic', 'banner-ad', 'advertisement', 'tracking', 'beacon',
+    'subscribe', 'newsletter', 'social', 'share', 'follow',
+    'google.com/s2', 'news.google.com', 'gravatar', 'disqus',
 ]
 
+# Domains that always serve generic/stock OG images — skip scraping
+_SKIP_SCRAPE_DOMAINS = {
+    "ft.com", "wsj.com", "bloomberg.com", "britannica.com",
+    "statista.com", "pewresearch.org", "cfr.org", "un.org",
+    "worldbank.org", "imf.org", "brookings.edu", "rand.org",
+    "foreignaffairs.com", "pbs.org", "newyorker.com",
+    "history.com", "thoughtco.com", "worldatlas.com",
+}
 
-def _is_likely_stock_image(img_url, article_url=""):
+
+def _is_valid_image_url(src: str, base_url: str = "") -> str:
     """
-    Returns True if the image is likely a generic/stock image unrelated to the article.
-    Checks both the image URL patterns and whether the source domain is a known offender.
+    Validates and normalises an image URL.
+    - Converts relative URLs to absolute using base_url
+    - Skips SVGs, data URIs, known bad patterns
+    - Returns cleaned URL string or "" if invalid
     """
-    if not img_url:
-        return False
-    il = img_url.lower()
-    # Check stock URL fragments
-    if any(frag in il for frag in _STOCK_URL_FRAGMENTS):
-        return True
-    # Check if article domain is a known stock-image offender
-    if article_url:
-        try:
-            host = urllib.parse.urlparse(article_url).netloc.lower().lstrip("www.")
-            if host in _STOCK_IMAGE_DOMAINS or any(host.endswith("." + d) for d in _STOCK_IMAGE_DOMAINS):
-                return True
-        except Exception:
-            pass
-    return False
+    if not src:
+        return ""
+    src = src.strip()
+
+    # Convert protocol-relative
+    if src.startswith("//"):
+        src = "https:" + src
+
+    # Convert relative URLs to absolute
+    if base_url and not src.startswith("http"):
+        src = urljoin(base_url, src)
+
+    if not src.startswith("http"):
+        return ""
+
+    sl = src.lower()
+
+    # Skip SVGs (usually icons/logos)
+    if sl.endswith(".svg") or ".svg?" in sl or ".svg#" in sl:
+        return ""
+
+    # Skip data URIs
+    if sl.startswith("data:"):
+        return ""
+
+    # Skip known bad patterns
+    if any(skip in sl for skip in _SKIP_PATTERNS):
+        return ""
+
+    # Skip tiny images embedded in URL dimensions (e.g. /48x48/ or _32x32.)
+    dm = re.search(r'[/_\-](\d{1,3})x(\d{1,3})[/_\-.]', src)
+    if dm:
+        w, h = int(dm.group(1)), int(dm.group(2))
+        if w < 200 or h < 150:
+            return ""
+
+    return src
 
 
-def _resolve_article_image(urlToImage, rss_img, url, title):
-    # 1. NewsAPI urlToImage — most reliable, but skip if from stock domain
-    if urlToImage and _is_clean_image(urlToImage) and not _is_likely_stock_image(urlToImage, url):
-        return urlToImage
+def _get_image_score(img_tag, base_url: str) -> tuple:
+    """
+    Scores an <img> tag for likelihood of being the article's hero image.
+    Returns (score, src_url). Higher score = better candidate.
+    """
+    src = (
+        img_tag.get("src") or
+        img_tag.get("data-src") or
+        img_tag.get("data-lazy-src") or
+        img_tag.get("data-original") or
+        img_tag.get("data-srcset", "").split()[0] or
+        img_tag.get("srcset", "").split()[0] or
+        ""
+    )
+    src = _is_valid_image_url(src, base_url)
+    if not src:
+        return (0, "")
 
-    # 2. RSS media image — skip if stock
-    if rss_img and _is_clean_image(rss_img) and not _is_likely_stock_image(rss_img, url):
-        return rss_img
+    score = 10  # base score
 
-    # 3. Scrape OG image from the actual article page
-    #    Skip scraping entirely for known stock-image domains
-    if url and url.startswith("http") and not _is_likely_stock_image("", url):
-        try:
-            real_url = _resolve_real_url(url)
-            scraped = fetch_article_image(real_url)
-            if scraped and _is_clean_image(scraped) and not _is_likely_stock_image(scraped, url):
-                return scraped
-        except Exception:
-            pass
+    # Explicit width/height — bigger = better
+    try:
+        w = int(img_tag.get("width") or 0)
+        h = int(img_tag.get("height") or 0)
+        if w and h:
+            if w < 200 or h < 150:
+                return (0, "")  # too small
+            score += min(w * h // 10000, 50)  # up to +50 for large images
+    except (ValueError, TypeError):
+        pass
 
-    # 4. Smart topic fallback — uses article title for relevant placeholder
-    return _make_fallback_image(title)
+    # Article-related URL fragments boost score
+    ARTICLE_HINTS = (
+        "article", "news", "story", "content", "media", "photo",
+        "image", "upload", "cdn", "img", "picture", "featured",
+    )
+    sl = src.lower()
+    if any(hint in sl for hint in ARTICLE_HINTS):
+        score += 20
+
+    # Alt text quality
+    alt = (img_tag.get("alt") or "").lower()
+    if alt and len(alt) > 5 and not any(skip in alt for skip in _SKIP_PATTERNS):
+        score += 10
+
+    # Class name hints
+    cls = " ".join(img_tag.get("class") or []).lower()
+    GOOD_CLASSES = ("featured", "hero", "article", "post", "thumbnail", "cover", "main")
+    BAD_CLASSES  = ("logo", "icon", "avatar", "author", "social", "ad", "sponsor")
+    if any(c in cls for c in GOOD_CLASSES):
+        score += 15
+    if any(c in cls for c in BAD_CLASSES):
+        return (0, "")
+
+    # Penalise very short URLs (likely generated placeholders)
+    if len(src) < 30:
+        score -= 5
+
+    return (score, src)
 
 
-def fetch_article_image(url):
+def extract_thumbnail(url: str) -> str:
+    """
+    Robust article thumbnail extractor.
+
+    Priority order:
+      1. og:image:secure_url  (most reliable)
+      2. og:image
+      3. twitter:image:src / twitter:image
+      4. JSON-LD  (schema.org Article/NewsArticle image field)
+      5. Best scored <img> in article body
+
+    Features:
+      - Caches results for 1 hour (THUMBNAIL_CACHE)
+      - Converts relative → absolute URLs (urljoin)
+      - Skips logos/icons/avatars/sprites/tiny images
+      - 5-second timeout, proper User-Agent
+      - Safe fallback: returns "" (caller decides placeholder)
+    """
     if not url or not url.startswith("http"):
         return ""
 
+    # ── Cache check ───────────────────────────────────────────────────────
     cached = THUMBNAIL_CACHE.get(url)
     if cached and (time.time() - cached["ts"]) < CACHE_EXPIRY_SECONDS:
-        return cached["image"]
+        return cached.get("image", "")
 
-    def _store(img):
+    def _store(img: str) -> str:
         THUMBNAIL_CACHE[url] = {"image": img, "ts": time.time()}
         return img
 
-    real_url = _resolve_real_url(url)
-
-    BROWSER_UA = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    )
-
+    # ── Skip known paywalled / stock-image domains ────────────────────────
     try:
-        ml = requests.get(
-            "https://api.microlink.io",
-            params={"url": real_url, "meta": "true"},
-            timeout=6,
-            headers={"User-Agent": "TruthLens/2.0"},
-        )
-        if ml.status_code == 200:
-            data = ml.json()
-            if data.get("status") == "success":
-                img_obj = (data.get("data") or {}).get("image") or {}
-                img_url = img_obj.get("url", "") if isinstance(img_obj, dict) else ""
-                if img_url and _is_clean_image(img_url):
-                    return _store(img_url)
+        host = urlparse(url).netloc.lower().lstrip("www.")
+        if host in _SKIP_SCRAPE_DOMAINS or any(host.endswith("." + d) for d in _SKIP_SCRAPE_DOMAINS):
+            return _store("")
     except Exception:
         pass
 
+    # ── Fetch HTML ────────────────────────────────────────────────────────
     try:
         resp = requests.get(
-            real_url,
-            headers={
-                "User-Agent":      BROWSER_UA,
-                "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5",
-                "Accept-Encoding": "gzip, deflate, br",
-                "DNT":             "1",
-            },
-            timeout=6,
+            url,
+            headers=_BROWSER_HEADERS,
+            timeout=5,
             stream=True,
             allow_redirects=True,
         )
         if resp.status_code not in (200, 203):
             return _store("")
         ct = resp.headers.get("Content-Type", "")
-        if ct and "html" not in ct:
+        if ct and "html" not in ct.lower():
             return _store("")
 
+        # Read up to 400 KB — enough for <head> + early <body>
         raw = b""
         for chunk in resp.iter_content(chunk_size=8192):
             raw += chunk
-            if len(raw) >= 300000:
+            if len(raw) >= 400_000:
                 break
 
-        html = raw.decode("utf-8", errors="ignore")
-        result = _extract_og_image_from_html(html)
-
-        if result and _is_clean_image(result):
-            return _store(result)
+        html = raw.decode("utf-8", errors="replace")
+        base_url = resp.url  # final URL after redirects
 
     except Exception:
-        pass
+        return _store("")
+
+    # ── Parse HTML once ───────────────────────────────────────────────────
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        return _store("")
+
+    # ── PRIORITY 1 & 2: Open Graph ────────────────────────────────────────
+    for prop in ("og:image:secure_url", "og:image"):
+        tag = soup.find("meta", property=prop)
+        if tag:
+            src = _is_valid_image_url((tag.get("content") or "").strip(), base_url)
+            if src:
+                return _store(src)
+
+    # ── PRIORITY 3: Twitter Card ──────────────────────────────────────────
+    for name in ("twitter:image:src", "twitter:image"):
+        tag = soup.find("meta", attrs={"name": name})
+        if tag:
+            src = _is_valid_image_url((tag.get("content") or "").strip(), base_url)
+            if src:
+                return _store(src)
+
+    # ── PRIORITY 4: JSON-LD (schema.org) ─────────────────────────────────
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            raw_json = script.string or ""
+            if not raw_json.strip():
+                continue
+            data = json.loads(raw_json)
+            # JSON-LD can be a list or a dict
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                # Handle @graph wrapper
+                if "@graph" in item:
+                    items.extend(item["@graph"])
+                    continue
+                img = item.get("image") or item.get("thumbnailUrl") or ""
+                if isinstance(img, dict):
+                    img = img.get("url", "")
+                elif isinstance(img, list):
+                    img = img[0] if img else ""
+                    if isinstance(img, dict):
+                        img = img.get("url", "")
+                src = _is_valid_image_url(str(img).strip(), base_url)
+                if src:
+                    return _store(src)
+        except Exception:
+            continue
+
+    # ── PRIORITY 5: Best scored <img> in article body ─────────────────────
+    # Look inside article/main containers first, then whole body
+    containers = (
+        soup.find_all("article") or
+        soup.find_all("main") or
+        [soup.find(id=re.compile(r"(content|article|story|body|post)", re.I))] or
+        [soup.body]
+    )
+    containers = [c for c in containers if c]
+
+    best_score, best_src = 0, ""
+    for container in containers[:3]:
+        for img_tag in container.find_all("img")[:40]:
+            score, src = _get_image_score(img_tag, base_url)
+            if score > best_score:
+                best_score = score
+                best_src = src
+
+    if best_src and best_score >= 15:
+        return _store(best_src)
 
     return _store("")
 
 
-_TOPIC_IMAGE_SEEDS = {
-    "ukraine":      433, "russia":       434, "war":          435,
-    "conflict":     436, "invasion":     437, "frontline":    438,
-    "military":     439, "ceasefire":    440, "zelensky":     441,
-    "zelenskyy":    442, "putin":        443, "nato":         444,
-    "israel":       450, "gaza":         451, "hamas":        452,
-    "palestine":    453, "trump":        460, "biden":        461,
-    "kamala":       462, "election":     463, "president":    464,
-    "congress":     465, "senate":       466, "democrat":     467,
-    "republican":   468, "india":        470, "modi":         471,
-    "delhi":        472, "mumbai":       473, "parliament":   474,
-    "bjp":          475, "isro":         480, "chandrayaan":  481,
-    "gaganyaan":    482, "moon":         483, "nasa":         484,
-    "space":        485, "rocket":       486, "satellite":    487,
-    "james webb":   488, "alphafold":    489, "deepmind":     490,
-    "cricket":      500, "ipl":          501, "t20":          502,
-    "rohit":        503, "kohli":        504, "world cup":    505,
-    "artificial":   510, "intelligence": 511, "chatgpt":      512,
-    "openai":       513, "google":       514, "apple":        515,
-    "iphone":       516, "microsoft":    517, "musk":         518,
-    "elon":         519, "tesla":        520, "twitter":      521,
-    "facebook":     522, "meta":         523, "cyber":        524,
-    "hack":         525, "economy":      530, "stock":        531,
-    "market":       532, "bank":         533, "bitcoin":      534,
-    "crypto":       535, "inflation":    536, "trade":        537,
-    "sensex":       538, "nifty":        539, "covid":        540,
-    "coronavirus":  541, "virus":        542, "vaccine":      543,
-    "pandemic":     544, "health":       545, "hospital":     546,
-    "doctor":       547, "mpox":         548, "climate":      550,
-    "environment":  551, "flood":        552, "earthquake":   553,
-    "global warming": 554, "fake":       560, "fact":         561,
-    "misinformation": 562, "debunk":     563, "hoax":         564,
-    "conspiracy":   565, "flat earth":   566, "moon landing": 567,
-    "apollo":       568, "5g":           569, "chemtrail":    570,
-    "illuminati":   571, "deep state":   572, "qanon":        573,
-    "new world order": 574, "bill gates": 580, "zuckerberg":  581,
-    "sam altman":   582, "soros":        583, "breaking":     590,
-    "news":         591,
+# ─────────────────────────────────────────────────────────────────────────────
+# ══ TOPIC-BASED FALLBACK IMAGE (for when scraping yields nothing) ═══════════
+# Uses deterministic Wikimedia URLs — topic-relevant, permanent, free
+# ─────────────────────────────────────────────────────────────────────────────
+
+_TOPIC_FALLBACKS = {
+    "war": [
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/4/4f/Kharkiv_after_Russian_bombardment%2C_2022.jpg/800px-Kharkiv_after_Russian_bombardment%2C_2022.jpg",
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/4/49/Flag_of_Ukraine.svg/800px-Flag_of_Ukraine.svg.png",
+    ],
+    "mideast": [
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/d/d4/Flag_of_Israel.svg/800px-Flag_of_Israel.svg.png",
+    ],
+    "politics": [
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/1/1a/US_Capitol_Building_at_night_Jan_2006.jpg/800px-US_Capitol_Building_at_night_Jan_2006.jpg",
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/5/56/Donald_Trump_official_portrait.jpg/800px-Donald_Trump_official_portrait.jpg",
+    ],
+    "space": [
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/b/b4/Chandrayaan-3_spacecraft.jpg/800px-Chandrayaan-3_spacecraft.jpg",
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/e/e1/FullMoon2010.jpg/800px-FullMoon2010.jpg",
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/9/9e/Milky_Way_Arch.jpg/800px-Milky_Way_Arch.jpg",
+    ],
+    "sports": [
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/5/59/Cricket_pictogram.svg/800px-Cricket_pictogram.svg.png",
+    ],
+    "tech": [
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/0/04/ChatGPT_logo.svg/800px-ChatGPT_logo.svg.png",
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/3/34/Elon_Musk_Royal_Society_%28crop2%29.jpg/800px-Elon_Musk_Royal_Society_%28crop2%29.jpg",
+    ],
+    "finance": [
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/4/46/Bitcoin.svg/800px-Bitcoin.svg.png",
+    ],
+    "health": [
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/8/82/SARS-CoV-2_without_background.png/800px-SARS-CoV-2_without_background.png",
+    ],
+    "climate": [
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/9/97/The_Earth_seen_from_Apollo_17.jpg/800px-The_Earth_seen_from_Apollo_17.jpg",
+    ],
+    "india": [
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/4/41/Flag_of_India.svg/800px-Flag_of_India.svg.png",
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/c/c0/Narendra_Modi_-_2014_%28cropped%29.jpg/800px-Narendra_Modi_-_2014_%28cropped%29.jpg",
+    ],
+    "factcheck": [
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/3/38/Info_Simple_bw.svg/800px-Info_Simple_bw.svg.png",
+    ],
+    "news": [
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/1/1a/US_Capitol_Building_at_night_Jan_2006.jpg/800px-US_Capitol_Building_at_night_Jan_2006.jpg",
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/9/97/The_Earth_seen_from_Apollo_17.jpg/800px-The_Earth_seen_from_Apollo_17.jpg",
+    ],
 }
 
-_NEUTRAL_SEEDS = [10, 20, 30, 40, 50, 60, 70, 80]
 
+def _make_fallback_image(title: str, index: int = 0) -> str:
+    """Returns a topic-relevant fallback image URL based on article title."""
+    t     = (title or "").lower()
+    t_raw = (title or "")
 
-def _make_fallback_image(title):
-    """
-    Generate a topic-relevant placeholder using picsum.photos.
-    Handles both English and Hindi title keywords so Hindi articles
-    get relevant images instead of the generic 'news' bucket.
-    """
-    t = (title or "").lower()
-    variation = abs(hash(title or "x")) % 10
-
-    # ── Hindi keyword check (original Unicode, not lowercased) ───────────
-    t_orig = (title or "")
+    # Hindi keyword detection
     HINDI_MAP = [
-        ("space",     ["इसरो", "चंद्रयान", "गगनयान", "अंतरिक्ष", "नासा",
-                       "रॉकेट", "उपग्रह", "स्पेस", "अंतरिक्ष दिवस"]),
-        ("sports",    ["क्रिकेट", "विश्व कप", "आईपीएल", "रोहित", "विराट",
-                       "धोनी", "टी20", "खेल", "ओलंपिक", "टूर्नामेंट"]),
-        ("health",    ["कोरोना", "कोविड", "वैक्सीन", "टीका", "स्वास्थ्य",
-                       "अस्पताल", "वायरस", "महामारी", "दवा"]),
-        ("factcheck", ["फेक", "झूठ", "अफवाह", "फर्जी", "फैक्ट",
-                       "भ्रामक", "गलत", "माइक्रोचिप", "षड्यंत्र"]),
-        ("tech",      ["तकनीक", "एआई", "आर्टिफिशियल", "मोबाइल", "इंटरनेट",
-                       "5जी", "डिजिटल", "साइबर", "ऐप"]),
-        ("finance",   ["अर्थव्यवस्था", "बजट", "शेयर", "बाजार", "रुपया",
-                       "बैंक", "जीडीपी", "सेंसेक्स", "निफ्टी"]),
-        ("war",       ["युद्ध", "रूस", "यूक्रेन", "हमला", "सेना",
-                       "हमास", "इजरायल", "गाजा", "संघर्ष", "मिसाइल"]),
-        ("politics",  ["चुनाव", "राजनीति", "नेता", "पार्टी", "ट्रम्प", "बाइडेन"]),
-        ("india",     ["भारत", "मोदी", "संसद", "लोकसभा", "भाजपा", "कांग्रेस",
-                       "दिल्ली", "मुंबई", "राष्ट्रीय", "मंत्री", "सरकार"]),
+        ("space",    ["इसरो", "चंद्रयान", "गगनयान", "अंतरिक्ष", "नासा", "रॉकेट", "उपग्रह"]),
+        ("sports",   ["क्रिकेट", "विश्व कप", "आईपीएल", "रोहित", "विराट", "धोनी", "टी20"]),
+        ("health",   ["कोरोना", "कोविड", "वैक्सीन", "टीका", "स्वास्थ्य", "वायरस", "महामारी"]),
+        ("factcheck",["फेक", "झूठ", "अफवाह", "फर्जी", "फैक्ट", "भ्रामक", "माइक्रोचिप"]),
+        ("tech",     ["तकनीक", "एआई", "मोबाइल", "इंटरनेट", "5जी", "डिजिटल", "साइबर"]),
+        ("finance",  ["अर्थव्यवस्था", "बजट", "शेयर", "बाजार", "रुपया", "बैंक", "सेंसेक्स"]),
+        ("war",      ["युद्ध", "रूस", "यूक्रेन", "हमला", "सेना", "हमास", "इजरायल", "गाजा"]),
+        ("india",    ["भारत", "मोदी", "संसद", "लोकसभा", "भाजपा", "दिल्ली", "मुंबई"]),
     ]
-    for base, kw_list in HINDI_MAP:
-        if any(kw in t_orig for kw in kw_list):
-            return f"https://picsum.photos/seed/{base}{variation}/800/450"
+    for topic, kws in HINDI_MAP:
+        if any(kw in t_raw for kw in kws):
+            imgs = _TOPIC_FALLBACKS.get(topic, _TOPIC_FALLBACKS["news"])
+            return imgs[index % len(imgs)]
 
-    # ── English keyword matching ───────────────────────────────────────────
-    if any(k in t for k in ["ukraine", "russia", "war", "conflict", "invasion",
-                              "frontline", "zelensky", "putin", "nato", "military",
-                              "missile", "troops", "combat"]):
-        base = "war"
+    # English keyword detection
+    if any(k in t for k in ["ukraine", "russia", "war", "conflict", "invasion", "putin", "zelensky", "nato", "missile", "troops"]):
+        topic = "war"
     elif any(k in t for k in ["israel", "gaza", "hamas", "palestine"]):
-        base = "mideast"
-    elif any(k in t for k in ["trump", "biden", "election", "president",
-                                "congress", "senate", "democrat", "republican",
-                                "white house", "capitol", "kamala"]):
-        base = "politics"
-    elif any(k in t for k in ["isro", "chandrayaan", "moon", "nasa", "space",
-                                "rocket", "satellite", "gaganyaan", "lunar",
-                                "orbit", "spacecraft", "astronaut", "space day",
-                                "antriksh", "national space"]):
-        base = "space"
-    elif any(k in t for k in ["india", "modi", "delhi", "mumbai", "bjp",
-                                "parliament", "lok sabha"]):
-        base = "india"
-    elif any(k in t for k in ["cricket", "ipl", "t20", "rohit", "kohli",
-                                "world cup", "sports", "olympic", "fifa",
-                                "tournament", "stadium"]):
-        base = "sports"
-    elif any(k in t for k in ["chatgpt", "openai", "artificial", " ai", "ai ",
-                                "tech", "google", "apple", "microsoft", "musk",
-                                "tesla", "5g", "cyber", "digital", "software"]):
-        base = "tech"
-    elif any(k in t for k in ["economy", "stock", "market", "bitcoin", "crypto",
-                                "inflation", "finance", "bank", "gdp", "budget",
-                                "sensex", "nifty", "rupee"]):
-        base = "finance"
-    elif any(k in t for k in ["covid", "coronavirus", "vaccine", "pandemic",
-                                "virus", "health", "hospital", "doctor",
-                                "disease", "medicine", "mpox"]):
-        base = "health"
-    elif any(k in t for k in ["climate", "environment", "flood", "earthquake",
-                                "cyclone", "drought", "pollution"]):
-        base = "climate"
-    elif any(k in t for k in ["fake", "fact", "misinformation", "debunk",
-                                "hoax", "conspiracy", "misleading"]):
-        base = "factcheck"
+        topic = "mideast"
+    elif any(k in t for k in ["trump", "biden", "election", "president", "democrat", "republican", "senate", "kamala", "capitol"]):
+        topic = "politics"
+    elif any(k in t for k in ["isro", "chandrayaan", "moon", "nasa", "space", "rocket", "satellite", "gaganyaan", "lunar", "astronaut"]):
+        topic = "space"
+    elif any(k in t for k in ["india", "modi", "delhi", "mumbai", "bjp", "parliament", "lok sabha"]):
+        topic = "india"
+    elif any(k in t for k in ["cricket", "ipl", "t20", "rohit", "kohli", "world cup", "sports", "olympic", "tournament"]):
+        topic = "sports"
+    elif any(k in t for k in ["chatgpt", "openai", "artificial", " ai", "ai ", "tech", "google", "apple", "microsoft", "musk", "tesla", "5g", "cyber", "digital", "software"]):
+        topic = "tech"
+    elif any(k in t for k in ["economy", "stock", "market", "bitcoin", "crypto", "inflation", "finance", "bank", "gdp", "budget", "sensex", "nifty", "rupee"]):
+        topic = "finance"
+    elif any(k in t for k in ["covid", "coronavirus", "vaccine", "pandemic", "virus", "health", "hospital", "doctor", "disease", "medicine", "mpox"]):
+        topic = "health"
+    elif any(k in t for k in ["climate", "environment", "flood", "earthquake", "cyclone", "drought", "pollution"]):
+        topic = "climate"
+    elif any(k in t for k in ["fake", "fact", "misinformation", "debunk", "hoax", "conspiracy", "misleading"]):
+        topic = "factcheck"
     else:
-        base = "news"
+        topic = "news"
 
-    return f"https://picsum.photos/seed/{base}{variation}/800/450"
+    imgs = _TOPIC_FALLBACKS.get(topic, _TOPIC_FALLBACKS["news"])
+    return imgs[index % len(imgs)]
 
 
-def _rss_item_image(item):
+def _is_clean_image(url: str) -> bool:
+    """Quick check: is this URL a usable image (not favicon/tracking pixel/etc)?"""
+    if not url or not isinstance(url, str):
+        return False
+    url = url.strip()
+    if not url.startswith("http"):
+        return False
+    ul = url.lower()
+    BAD = ["favicon", "sprite", "1x1", "pixel", "spacer", "tracking",
+           "beacon", "news.google.com", "google.com/s2"]
+    return not any(b in ul for b in BAD)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ══ ARTICLE IMAGE RESOLVER — integrates extract_thumbnail into pipeline ══════
+# ─────────────────────────────────────────────────────────────────────────────
+
+def resolve_article_image(newsapi_url_to_image: str, rss_img: str,
+                          article_url: str, title: str, index: int = 0) -> str:
+    """
+    Full resolution pipeline for a single article thumbnail.
+
+    1. NewsAPI urlToImage  → validated directly (already fetched by NewsAPI)
+    2. RSS media image     → validated directly
+    3. extract_thumbnail() → scrape OG/Twitter/JSON-LD/best-img from article page
+    4. Topic fallback      → deterministic Wikimedia image based on title keywords
+
+    Never returns None or empty string — always returns a usable URL.
+    """
+    # 1. NewsAPI image — most reliable since NewsAPI already resolved it
+    if newsapi_url_to_image and _is_clean_image(newsapi_url_to_image):
+        cleaned = _is_valid_image_url(newsapi_url_to_image)
+        if cleaned:
+            return cleaned
+
+    # 2. RSS image
+    if rss_img and _is_clean_image(rss_img):
+        cleaned = _is_valid_image_url(rss_img)
+        if cleaned:
+            return cleaned
+
+    # 3. Scrape the article page
+    if article_url and article_url.startswith("http"):
+        # Resolve redirects (Google News, t.co, etc.)
+        real_url = _resolve_redirect(article_url)
+        scraped  = extract_thumbnail(real_url)
+        if scraped:
+            return scraped
+
+    # 4. Topic fallback
+    return _make_fallback_image(title, index)
+
+
+def _resolve_redirect(url: str) -> str:
+    """Follow redirects for known redirect hosts (Google News, t.co, etc.)."""
+    REDIRECT_HOSTS = ("news.google.com", "t.co", "bit.ly", "ow.ly",
+                      "tinyurl.com", "buff.ly", "dlvr.it")
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return url
+
+    if not any(h in host for h in REDIRECT_HOSTS):
+        return url
+
+    cache_key = "__redirect__" + url
+    cached = THUMBNAIL_CACHE.get(cache_key)
+    if cached and (time.time() - cached["ts"]) < CACHE_EXPIRY_SECONDS:
+        return cached.get("image") or url
+
+    try:
+        r = requests.get(url, headers=_BROWSER_HEADERS,
+                         allow_redirects=True, timeout=5)
+        final = r.url
+        if final and "news.google.com" not in final and final.startswith("http"):
+            THUMBNAIL_CACHE[cache_key] = {"image": final, "ts": time.time()}
+            return final
+    except Exception:
+        pass
+    return url
+
+
+def fetch_images_parallel(articles: list, url_key: str = "link",
+                          image_key: str = "image") -> None:
+    """
+    Parallel thumbnail resolution for a batch of articles.
+    Articles that already have a valid image are skipped.
+    Results are written in-place into the article dicts.
+    """
+    BLOCKED_DOMAINS = {"ft.com", "wsj.com"}
+
+    def _blocked(u: str) -> bool:
+        try:
+            host = urlparse(u).netloc.lower().lstrip("www.")
+            return any(host == d or host.endswith("." + d) for d in BLOCKED_DOMAINS)
+        except Exception:
+            return False
+
+    # Identify articles that need image resolution
+    missing = [
+        i for i, a in enumerate(articles)
+        if not a.get(image_key) or not _is_clean_image(a.get(image_key, ""))
+    ]
+    scrapable = [i for i in missing if not _blocked(articles[i].get(url_key, ""))]
+
+    if scrapable:
+        max_workers = min(6, len(scrapable))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {
+                ex.submit(
+                    resolve_article_image,
+                    articles[i].get("urlToImage", ""),
+                    articles[i].get(image_key, ""),
+                    articles[i].get(url_key, ""),
+                    articles[i].get("title", "") or articles[i].get("desc", ""),
+                    i,
+                ): i
+                for i in scrapable
+            }
+            done, _ = concurrent.futures.wait(futures, timeout=14)
+            for fut in done:
+                i = futures[fut]
+                try:
+                    img = fut.result()
+                    if img:
+                        articles[i][image_key] = img
+                except Exception:
+                    pass
+
+    # Final pass: ensure every article has at least the fallback image
+    for idx, article in enumerate(articles):
+        img = article.get(image_key, "")
+        if not img or not _is_clean_image(img):
+            article[image_key] = _make_fallback_image(
+                article.get("title", "") or article.get("desc", ""), idx
+            )
+
+
+def _rss_item_image(item) -> str:
+    """Extract image URL from an RSS item's media tags."""
     SKIP = ['logo', 'icon', 'sprite', 'favicon', 'avatar', 'placeholder',
             'blank', 'pixel', 'spacer', '1x1', 'tracking', 'beacon',
             'news.google.com', 'google.com/s2']
 
-    def _clean(url):
+    def _clean(url: str) -> str:
         if not url:
             return ""
         url = url.strip()
@@ -1911,8 +1067,7 @@ def _rss_item_image(item):
 
     desc_el = item.find("description")
     if desc_el:
-        desc_html = str(desc_el)
-        m = re.search(r'<img[^>]+src=["\']([^"\']{10,})["\']', desc_html, re.I)
+        m = re.search(r'<img[^>]+src=["\']([^"\']{10,})["\']', str(desc_el), re.I)
         if m:
             img = _clean(m.group(1))
             if img:
@@ -1921,70 +1076,604 @@ def _rss_item_image(item):
     return ""
 
 
-def fetch_images_parallel(articles, url_key="link", image_key="image"):
-    BLOCKED_DOMAINS = {"ft.com", "wsj.com"}
+# ═══════════════════════════════════════════════════════════════════════════════
+# ── EVENT DETECTION ────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    def _domain_blocked(u):
-        try:
-            host = urllib.parse.urlparse(u).netloc.lower().lstrip("www.")
-            return any(host == d or host.endswith("." + d) for d in BLOCKED_DOMAINS)
-        except Exception:
-            return False
+EVENT_TYPE_RULES = [
+    (r'\b(us|u\.s\.|united states|american|presidential)\s+(election|elections|vote|voting)\b',
+     "us_election",
+     lambda t, y: "2024 United States presidential election" if "2024" in t else "United States presidential election"),
+    (r'\b(election|elections|vote|voting)\b.{0,40}\b(us|u\.s\.|united states|america|american|trump|biden|harris|kamala)\b',
+     "us_election",
+     lambda t, y: "2024 United States presidential election" if "2024" in t else "United States presidential election"),
+    (r'\b(trump|biden|harris|kamala).{0,40}\b(election|elected|wins|won|president|presidential)\b',
+     "us_election",
+     lambda t, y: "2024 United States presidential election"),
+    (r'\b(india|indian|lok sabha|assembly)\s+(election|elections|vote|voting)\b',
+     "india_election",
+     lambda t, y: "2024 Indian general election" if "2024" in t else "Elections in India"),
+    (r'\b(t20|twenty20|icc|ipl)\s+(world cup|wc|championship)\b',
+     "cricket_t20wc",
+     lambda t, y: "2024 ICC Men's T20 World Cup" if "2024" in t else "ICC Men's T20 World Cup"),
+    (r'\b(world cup|wc)\b.{0,30}\b(t20|twenty20|cricket|india|rohit|kohli)\b',
+     "cricket_t20wc",
+     lambda t, y: "2024 ICC Men's T20 World Cup" if "2024" in t else "ICC Men's T20 World Cup"),
+    (r'\b(india|rohit sharma|rohit|virat kohli|virat|kohli).{0,40}\b(world cup|wc|t20|icc)\b',
+     "cricket_t20wc",
+     lambda t, y: "2024 ICC Men's T20 World Cup" if "2024" in t else "ICC Men's T20 World Cup"),
+    (r'\bipl\b',
+     "cricket_ipl",
+     lambda t, y: "Indian Premier League"),
+    (r'\brussia\s+invade[sd]?\s+ukraine|\brussia[n]?\s+invasion\s+of\s+ukraine',
+     "russia_ukraine",
+     lambda t, y: "2022 Russian invasion of Ukraine"),
+    (r'\b(?:russia|russian|ukraine|ukrainian|putin|zelensky|zelenskyy)\b.{0,50}\b(?:war|invasion|conflict|troops|missile|offensive)\b',
+     "russia_ukraine",
+     lambda t, y: "2022 Russian invasion of Ukraine"),
+    (r'\brussia\s+launch\w*\s+\w+\s+ukraine|\b(?:invasion|war)\b.{0,30}\b(?:russia|ukraine)\b',
+     "russia_ukraine",
+     lambda t, y: "2022 Russian invasion of Ukraine"),
+    (r'\bhamas\s+attack\w*\b',
+     "hamas_israel",
+     lambda t, y: "2023 Hamas-led attack on Israel"),
+    (r'\b(?:hamas|israel|israeli|gaza|palestine|palestinian)\b.{0,40}\b(?:attack(?:ed)?|war|killed|conflict|bomb(?:ed)?|missile)\b',
+     "hamas_israel",
+     lambda t, y: "2023 Hamas-led attack on Israel"),
+    (r'\boctober\s+7\b',
+     "hamas_israel",
+     lambda t, y: "2023 Hamas-led attack on Israel"),
+    (r'\b(chandrayaan|gaganyaan|aditya.?l1|pslv|gslv|isro)\b',
+     "isro_mission",
+     lambda t, y: "Chandrayaan-3" if "chandrayaan" in t else "Gaganyaan" if "gaganyaan" in t else "Indian Space Research Organisation"),
+    (r'\b(moon landing|lunar landing|moon mission).{0,30}\b(isro|india|chandrayaan)\b',
+     "isro_mission",
+     lambda t, y: "Chandrayaan-3"),
+    (r'\b(nasa|james webb|hubble|spacex|artemis|iss|space station)\b',
+     "nasa_space",
+     lambda t, y: "NASA" if "nasa" in t else "James Webb Space Telescope" if "james webb" in t or "webb" in t else "SpaceX" if "spacex" in t else "NASA"),
+    (r'\b(moon landing).{0,30}\b(fake|faked|hoax|kubrick|conspiracy)\b',
+     "moon_conspiracy",
+     lambda t, y: "Moon landing conspiracy theories"),
+    (r'\b(chatgpt|openai|gpt.?4|gpt.?3|sam altman)\b',
+     "openai",
+     lambda t, y: "ChatGPT" if "chatgpt" in t else "Sam Altman" if "sam altman" in t else "OpenAI"),
+    (r'\b(elon musk|twitter|x\.com).{0,30}\b(bought|acquired|acquisition|renamed|rebranded)\b',
+     "musk_twitter",
+     lambda t, y: "Acquisition of Twitter by Elon Musk"),
+    (r'\b(covid|coronavirus|sars.?cov|pandemic).{0,40}\b(vaccine|microchip|5g|spread|origin)\b',
+     "covid_misinfo",
+     lambda t, y: "COVID-19 vaccine misinformation" if any(w in t for w in ["vaccine","microchip","chip"]) else "5G conspiracy theories" if "5g" in t else "COVID-19 pandemic"),
+    (r'\b(vaccine|vaccination).{0,30}\b(microchip|chip|bill gates|tracking|5g)\b',
+     "vaccine_misinfo",
+     lambda t, y: "COVID-19 vaccine misinformation"),
+    (r'\b(climate change|global warming).{0,30}\b(hoax|fake|real|denial|scientific)\b',
+     "climate",
+     lambda t, y: "Climate change denial" if any(w in t for w in ["hoax","fake","denial"]) else "Climate change"),
+    (r'\b(flat earth|earth is flat)\b',
+     "flat_earth",
+     lambda t, y: "Flat Earth"),
+    (r'\b(illuminati|new world order|deep state|chemtrail|reptilian|qanon)\b',
+     "conspiracy",
+     lambda t, y: "Illuminati" if "illuminati" in t else "New World Order (conspiracy theory)" if "new world order" in t else "Deep state conspiracy theory" if "deep state" in t else "Chemtrail conspiracy theory" if "chemtrail" in t else "Reptilian conspiracy theory" if "reptilian" in t else "QAnon"),
+    (r'\b(alphafold|deepmind|protein folding)\b',
+     "science",
+     lambda t, y: "AlphaFold" if "alphafold" in t else "Google DeepMind"),
+    (r'\b(apple|iphone).{0,30}\b(revenue|record|launched|release|iphone 1[5-9])\b',
+     "apple",
+     lambda t, y: "Apple Inc."),
+    (r'\b(narendra modi|pm modi|prime minister india|bjp|congress india|lok sabha|parliament india)\b',
+     "india_politics",
+     lambda t, y: "Narendra Modi" if any(w in t for w in ["modi","narendra"]) else "Bharatiya Janata Party" if "bjp" in t else "Parliament of India"),
+    (r'(वैक्सीन|टीका).{0,30}(माइक्रोचिप|चिप|बिल गेट्स)',
+     "vaccine_misinfo",
+     lambda t, y: "COVID-19 vaccine misinformation"),
+    (r'(5g|5जी).{0,20}(कोरोना|covid|वायरस)',
+     "5g_misinfo",
+     lambda t, y: "5G conspiracy theories"),
+    (r'(चंद्रयान|गगनयान|इसरो)',
+     "isro_mission",
+     lambda t, y: "Chandrayaan-3" if "चंद्रयान" in t else "Gaganyaan" if "गगनयान" in t else "Indian Space Research Organisation"),
+    (r'(विश्व कप|t20 विश्व|आईसीसी)',
+     "cricket_t20wc",
+     lambda t, y: "2024 ICC Men's T20 World Cup" if "2024" in t else "ICC Men's T20 World Cup"),
+    (r'(रोहित शर्मा|विराट कोहली|धोनी)',
+     "cricket_t20wc",
+     lambda t, y: "2024 ICC Men's T20 World Cup"),
+    (r'(रूस|यूक्रेन|पुतिन)',
+     "russia_ukraine",
+     lambda t, y: "2022 Russian invasion of Ukraine"),
+    (r'(चुनाव|election).{0,20}(भारत|india)',
+     "india_election",
+     lambda t, y: "2024 Indian general election" if "2024" in t else "Elections in India"),
+    (r'(मोदी|भाजपा|बीजेपी|संसद|लोकसभा)',
+     "india_politics",
+     lambda t, y: "Narendra Modi" if "मोदी" in t else "Bharatiya Janata Party" if any(w in t for w in ["भाजपा","बीजेपी"]) else "Parliament of India"),
+    (r'(कोरोना|कोविड|covid).{0,30}(वायरस|pandemic|महामारी)',
+     "covid",
+     lambda t, y: "COVID-19 pandemic"),
+    (r'(चपटी पृथ्वी|flat earth)',
+     "flat_earth",
+     lambda t, y: "Flat Earth"),
+    (r'(इलुमिनाती|illuminati)',
+     "conspiracy",
+     lambda t, y: "Illuminati"),
+]
 
-    import concurrent.futures as _cf
 
-    missing = [i for i, a in enumerate(articles)
-               if not a.get(image_key) or not _is_clean_image(a.get(image_key, ""))]
-    scrapable = [i for i in missing
-                 if not _domain_blocked(articles[i].get(url_key, ""))]
+def detect_event_type(text):
+    t = text.lower()
+    year_match = re.search(r'\b(20\d{2})\b', t)
+    year_str = year_match.group(1) if year_match else ""
+    for pattern, etype, wiki_fn in EVENT_TYPE_RULES:
+        if re.search(pattern, t):
+            topic = wiki_fn(t, year_str)
+            return etype, topic
+    return None, None
 
-    if scrapable:
-        max_workers = min(6, len(scrapable))
-        with _cf.ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = {
-                ex.submit(
-                    _resolve_article_image,
-                    articles[i].get("urlToImage", ""),
-                    articles[i].get(image_key, ""),
-                    articles[i].get(url_key, ""),
-                    articles[i].get("title", "")
-                ): i
-                for i in scrapable
-            }
-            done, _ = _cf.wait(futures, timeout=12)
-            for fut in done:
-                i = futures[fut]
-                try:
-                    img = fut.result()
-                    if img and _is_clean_image(img):
-                        articles[i][image_key] = img
-                except Exception:
-                    pass
 
-    for article in articles:
-        img = article.get(image_key, "")
-        if img and not _is_clean_image(img):
-            article[image_key] = _make_fallback_image(
-                article.get("title", "") or article.get("desc", "")
-            )
-        elif not img:
-            article[image_key] = _make_fallback_image(
-                article.get("title", "") or article.get("desc", "")
-            )
+# ═══════════════════════════════════════════════════════════════════════════════
+# ── KEYWORD EXTRACTION ─────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+
+KNOWN_ENTITIES = [
+    "Donald Trump", "Joe Biden", "Kamala Harris", "Barack Obama",
+    "Narendra Modi", "PM Modi", "Rahul Gandhi", "Arvind Kejriwal",
+    "Vladimir Putin", "Volodymyr Zelensky", "Volodymyr Zelenskyy",
+    "Elon Musk", "Bill Gates", "Mark Zuckerberg", "Sam Altman",
+    "Rohit Sharma", "Virat Kohli", "MS Dhoni", "Sachin Tendulkar",
+    "George Soros", "Jeff Bezos", "Sundar Pichai",
+    "ISRO", "NASA", "WHO", "UN", "FBI", "CIA", "IMF", "WTO",
+    "OpenAI", "ChatGPT", "DeepMind", "AlphaFold",
+    "Apple", "Google", "Microsoft", "Meta", "Tesla", "Twitter",
+    "BJP", "Congress", "BBC", "Reuters", "CNN", "NDTV",
+    "ICC", "BCCI", "IPL",
+    "T20 World Cup", "ICC World Cup", "IPL", "Champions Trophy",
+    "Chandrayaan", "Gaganyaan", "Aditya-L1",
+    "Ukraine", "Russia", "Gaza", "Israel", "Palestine",
+    "Parliament", "Supreme Court", "Lok Sabha", "Rajya Sabha",
+    "White House", "Capitol Hill",
+]
+
+_ENTITY_PATTERNS = sorted(
+    [(e, re.compile(r'\b' + re.escape(e) + r'\b', re.IGNORECASE)) for e in KNOWN_ENTITIES],
+    key=lambda x: -len(x[0])
+)
+
+EVENT_PHRASE_PATTERNS = [
+    r'\b(?:us|u\.s\.|united states|american|presidential)\s+election(?:s)?\s*(?:20\d{2})?\b',
+    r'\b(?:lok sabha|assembly|india[n]?)\s+election(?:s)?\s*(?:20\d{2})?\b',
+    r'\b20\d{2}\s+(?:us|indian|presidential|general)\s+election(?:s)?\b',
+    r'\b(?:icc\s+)?t20\s+world\s+cup(?:\s+20\d{2})?\b',
+    r'\b(?:icc\s+)?(?:cricket\s+)?world\s+cup(?:\s+20\d{2})?\b',
+    r'\b(?:india|england|australia)\s+(?:vs?\.?|versus)\s+(?:india|england|australia|south africa|pakistan|new zealand)\b',
+    r'\bipl\s+(?:20\d{2}|season\s+\d+|final)?\b',
+    r'\brussia[n]?\s+invasion\s+of\s+ukraine\b',
+    r'\brussia[n]?\s*[-–]\s*ukraine\s+war\b',
+    r'\brussia\s+(?:invades?|invaded|launches?)\s+ukraine\b',
+    r'\bhamas\s+attack(?:ed|s)?\s+(?:on\s+)?israel\b',
+    r'\boctober\s+7\s+(?:attack|massacre|hamas)\b',
+    r'\bchandrayaan[- ]?(?:3|three|2|two|1|one)?\b',
+    r'\bgaganyaan\s+(?:mission|launch|crew)?\b',
+    r'\bisro\s+(?:launch(?:es?|ed)?|mission|satellite)\b',
+    r'\bnasa\s+(?:artemis|james\s+webb|moon|mars|launch)\b',
+    r'\b(?:openai|chatgpt)\s+(?:users?|weekly|monthly|launch(?:es?)?\b)',
+    r'\belon\s+musk\s+(?:buys?|bought|acquires?|acquired|twitter|x\.com)\b',
+    r'\bapple\s+(?:iphone\s+\d+|revenue|record|launch(?:es?|ed)?)\b',
+    r'\bmoon\s+landing\s+(?:fake|faked|hoax|conspiracy)\b',
+    r'\bapollo\s+(?:11|program)\s+(?:fake|faked|hoax)?\b',
+    r'\bvaccine\s+(?:microchip|chip|tracking|5g|bill\s+gates)\b',
+    r'\b5g\s+(?:towers?|network)\s+(?:spread|cause[sd]?|linked)\s+(?:covid|coronavirus|cancer)\b',
+    r'\bcovid\s*[-–]?\s*19\s+(?:pandemic|vaccine|origin|lab)\b',
+]
+
+_EVENT_PHRASE_COMPILED = [re.compile(p, re.IGNORECASE) for p in EVENT_PHRASE_PATTERNS]
+
+
+def extract_event_phrases(text):
+    found, seen = [], set()
+    for pat in _EVENT_PHRASE_COMPILED:
+        m = pat.search(text)
+        if m:
+            phrase = m.group(0).strip()
+            pl = phrase.lower()
+            if pl not in seen:
+                seen.add(pl)
+                found.append(phrase)
+    return sorted(found, key=len, reverse=True)
+
+
+def extract_known_entities(text):
+    found, seen = [], set()
+    for entity, pat in _ENTITY_PATTERNS:
+        if pat.search(text):
+            el = entity.lower()
+            if el not in seen:
+                seen.add(el)
+                found.append(entity)
+    return found
+
+
+def extract_named_entities(text):
+    entities = extract_known_entities(text)
+    en_caps = re.findall(r'\b([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,}){0,3})\b', text)
+    seen = set(e.lower() for e in entities)
+    for e in en_caps:
+        el = e.lower()
+        if el not in seen and el not in STOPWORDS_EN and len(el) > 3:
+            words = el.split()
+            if len(words) > 1 or (len(words) == 1 and len(words[0]) > 5):
+                seen.add(el)
+                entities.append(e)
+    hi_seqs = re.findall(r'[\u0900-\u097F]+(?:\s+[\u0900-\u097F]+)*', text)
+    for seq in hi_seqs:
+        if len(seq) > 3:
+            entities.append(seq)
+    seen2, result = set(), []
+    for e in sorted(entities, key=len, reverse=True):
+        el = e.lower()
+        if el not in seen2:
+            seen2.add(el)
+            result.append(e)
+    return result
+
+
+def extract_year(text):
+    m = re.search(r'\b(20\d{2}|19\d{2})\b', text)
+    return m.group(1) if m else ""
+
+
+def extract_keywords(text):
+    event_phrases = extract_event_phrases(text)
+    entities = extract_known_entities(text)
+    caps_nouns = []
+    seen = set(e.lower() for e in event_phrases + entities)
+    for e in re.findall(r'\b([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,}){0,2})\b', text):
+        el = e.lower()
+        if el not in seen and el not in STOPWORDS_EN and len(el) > 3:
+            seen.add(el)
+            caps_nouns.append(e)
+    year = extract_year(text)
+    hi_words = re.findall(r'[\u0900-\u097F]{3,}', text)
+    stopwords_hi = {"और","में","की","के","को","से","है","हैं","था","थी","थे","कि","यह","वह","इस","उस","जो","पर","भी","तो","हो","ने","एक","एवं","लेकिन"}
+    hi_filtered = [w for w in hi_words if w not in stopwords_hi][:4]
+    single_words = []
+    all_seen = set(e.lower() for e in event_phrases + entities + caps_nouns)
+    for w in re.findall(r'\b[a-zA-Z]{4,}\b', text):
+        wl = w.lower()
+        if wl not in STOPWORDS_EN and wl not in all_seen and len(wl) > 3:
+            all_seen.add(wl)
+            single_words.append(w)
+    combined = event_phrases[:2] + entities[:3] + caps_nouns[:2]
+    if year and year not in " ".join(combined):
+        combined.append(year)
+    combined += hi_filtered
+    combined += single_words[:max(0, 6 - len(combined))]
+    seen_final, result = set(), []
+    for kw in combined:
+        kl = kw.lower().strip()
+        if kl and kl not in seen_final:
+            seen_final.add(kl)
+            result.append(kw)
+    return result[:10]
+
+
+def extract_newsapi_keywords(text):
+    hi_translated = ""
+    if is_hindi(text):
+        hi_kw = _hindi_to_english_keywords(text)
+        hi_translated = " ".join(hi_kw)
+    work_text     = hi_translated if hi_translated else text
+    year          = extract_year(text) or extract_year(hi_translated)
+    _, event_wiki = detect_event_type(work_text) or detect_event_type(text)
+    entities      = extract_known_entities(work_text) or extract_known_entities(text)
+    event_phrases = extract_event_phrases(work_text) or extract_event_phrases(text)
+    _people_set   = {x.lower() for x in KNOWN_ENTITIES[:22]}
+    persons       = [e for e in entities if e.lower() in _people_set]
+    orgs          = [e for e in entities if e.lower() not in _people_set]
+
+    def _first_pos(lst, ref_text):
+        tl = ref_text.lower()
+        best_e, best_p = None, len(ref_text) + 1
+        for e in lst:
+            p = tl.find(e.lower())
+            if p != -1 and p < best_p:
+                best_p = p; best_e = e
+        return best_e
+
+    primary_person = _first_pos(persons, work_text)
+    primary_org    = _first_pos(orgs, work_text)
+    second_person  = next((e for e in persons if e != primary_person), None)
+    second_org     = next((e for e in orgs   if e != primary_org),    None)
+    parts, seen    = [], set()
+
+    def _add(s):
+        sl = (s or "").strip().lower()
+        if sl and sl not in seen and len(sl) > 1:
+            seen.add(sl); parts.append(s.strip())
+
+    _add(primary_person)
+    _add(second_person)
+    _add(primary_org)
+    _add(second_org)
+    _add(year)
+    if event_phrases:
+        ep = event_phrases[0]
+        ep_words = ep.split()[:4]
+        new_ep_words = [w for w in ep_words if w.lower() not in seen]
+        if new_ep_words:
+            _add(" ".join(new_ep_words))
+    if not event_phrases and event_wiki:
+        skip_ew = {"the","a","an","of","by","in","on","at","and","or","conspiracy","misinformation","theories","theory","denial"}
+        ew_words = [w for w in event_wiki.split() if w.lower() not in skip_ew][:3]
+        for w in ew_words:
+            _add(w)
+    if len(parts) < 2:
+        for w in re.findall(r'\b[a-zA-Z]{4,}\b', work_text or text):
+            if len(parts) >= 4:
+                break
+            wl = w.lower()
+            if wl not in STOPWORDS_EN and wl not in seen:
+                seen.add(wl); parts.append(w)
+    return parts[:5]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ── WIKIPEDIA TOPIC RESOLUTION ─────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def resolve_wiki_topic(claim_keywords, text):
+    text_lower = text.lower()
+    event_type, event_wiki = detect_event_type(text)
+    if event_wiki:
+        return event_wiki
+    text_clean    = re.sub(r'[^\w\s]', ' ', text_lower)
+    words_in_text = set(text_clean.split())
+    best_topic, best_score = "", 0.0
+    for key, topic in WIKI_TOPIC_MAP.items():
+        if any('\u0900' <= c <= '\u097F' for c in key):
+            if key in text:
+                score = 2.0 + len(key) * 0.05
+                if score > best_score:
+                    best_score = score; best_topic = topic
+            continue
+        key_words = key.split()
+        key_len   = len(key_words)
+        matched   = sum(1 for w in key_words if w in words_in_text)
+        if matched == 0:
+            continue
+        match_ratio = matched / key_len
+        min_ratio   = 0.6 if key_len <= 2 else 0.7 if key_len <= 4 else 0.80
+        if match_ratio < min_ratio:
+            continue
+        length_bonus   = key_len * 0.25
+        full_bonus     = 0.80 if match_ratio == 1.0 else 0.0
+        single_penalty = -0.40 if key_len == 1 else 0.0
+        positions      = [text_lower.find(w) for w in key_words if w in text_lower]
+        position_bonus = max(0.0, (200 - min((p for p in positions if p >= 0), default=200)) / 200) * 0.30 if positions else 0.0
+        score = match_ratio + length_bonus + full_bonus + single_penalty + position_bonus
+        if score > best_score:
+            best_score = score; best_topic = topic
+    if best_topic:
+        return best_topic
+    entities = extract_known_entities(text)
+    if entities:
+        def _pos(e):
+            p = text_lower.find(e.lower())
+            return p if p >= 0 else len(text)
+        for entity in sorted(entities, key=_pos)[:2]:
+            el = entity.lower()
+            if el in WIKI_TOPIC_MAP:
+                return WIKI_TOPIC_MAP[el]
+            for key, topic in WIKI_TOPIC_MAP.items():
+                if el in key or key in el:
+                    return topic
+    if claim_keywords:
+        for kw in claim_keywords[:3]:
+            kl = kw.lower()
+            if kl in WIKI_TOPIC_MAP:
+                return WIKI_TOPIC_MAP[kl]
+    return ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ── TWITTER QUERY GENERATION ───────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def generate_twitter_query(text, all_keywords, prediction):
+    t_lower = text.lower()
+    year    = extract_year(text)
+    event_type, event_wiki = detect_event_type(text)
+    all_entities  = extract_known_entities(text)
+    event_phrases = extract_event_phrases(text)
+    _people_set   = {x.lower() for x in KNOWN_ENTITIES[:22]}
+    persons = [e for e in all_entities if e.lower() in _people_set]
+    orgs    = [e for e in all_entities if e.lower() not in _people_set]
+
+    def _first_mentioned(entity_list):
+        best_e, best_pos = None, len(text) + 1
+        for e in entity_list:
+            pos = t_lower.find(e.lower())
+            if pos != -1 and pos < best_pos:
+                best_pos = pos; best_e = e
+        return best_e
+
+    primary_person = _first_mentioned(persons)
+    primary_org    = _first_mentioned(orgs)
+    primary        = primary_person or primary_org or ""
+    event_ctx      = ""
+    if event_phrases:
+        event_ctx = event_phrases[0]
+    elif event_wiki:
+        wiki_words = [w for w in event_wiki.split() if w.lower() not in {"the","a","an","of","by","in","on","at","and","or"}]
+        event_ctx  = " ".join(wiki_words[:5])
+    if not primary and event_wiki:
+        wiki_words = [w for w in event_wiki.split() if w.lower() not in {"the","a","an","of","by","in","on","at","and","or"}]
+        primary    = " ".join(wiki_words[:3])
+    if not primary and all_keywords:
+        en_kw   = [k for k in all_keywords if all(ord(c) < 128 for c in k)]
+        primary = " ".join(en_kw[:2])
+    second_person = next((e for e in persons if e != primary_person), None)
+    second_org    = next((e for e in orgs   if e != primary_org),    None)
+
+    def _dedup(*parts):
+        seen_w, out = set(), []
+        for part in parts:
+            if not part:
+                continue
+            for w in part.split():
+                if w.lower() not in seen_w:
+                    seen_w.add(w.lower()); out.append(w)
+        return " ".join(out).strip()
+
+    raw_queries = [_dedup(primary, event_ctx, year)]
+    if primary and year:
+        raw_queries.append(_dedup(primary, year))
+    elif primary and second_person:
+        raw_queries.append(_dedup(primary, second_person))
+    elif primary:
+        raw_queries.append(primary)
+    if event_wiki and year:
+        raw_queries.append(_dedup(event_wiki[:50], year))
+    elif event_ctx and year:
+        raw_queries.append(_dedup(event_ctx, year))
+    elif event_ctx:
+        raw_queries.append(event_ctx)
+    if second_person:
+        raw_queries.append(_dedup(second_person, event_ctx or year))
+    elif second_org and second_org != primary_org:
+        raw_queries.append(_dedup(second_org, year or event_ctx))
+    elif primary_org and primary_person:
+        raw_queries.append(_dedup(primary_org, year))
+    if prediction == "FAKE NEWS":
+        raw_queries.append(_dedup(primary or event_ctx, "fact check"))
+        raw_queries.append(_dedup(primary or event_ctx, "debunked misinformation"))
+    else:
+        raw_queries.append(_dedup(primary, second_person or second_org or primary_org, year))
+        if event_wiki:
+            raw_queries.append(event_wiki[:60])
+    seen_q, queries = set(), []
+    for q in raw_queries:
+        q = q.strip()
+        if not q or len(q) < 4:
+            continue
+        ql = q.lower()
+        if ql in seen_q or re.fullmatch(r"20\d{2}", q):
+            continue
+        seen_q.add(ql); queries.append(q)
+    if not queries:
+        kw_en   = [k for k in all_keywords if all(ord(c) < 128 for c in k)][:4]
+        queries = [_dedup(*kw_en[:3]), _dedup(*kw_en[:2])]
+        queries = [q for q in queries if q]
+    return queries[:7]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ── CORE SCORING ENGINE ────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def score_claim(text):
+    text_lower = text.lower()
+    text_clean = re.sub(r'[^\w\s]', ' ', text_lower)
+    kb_real = check_verified_event(text)
+    kb_fake = check_misinformation_kb(text)
+    if kb_real and kb_real[2] >= 0.75:
+        real_score = min(95, 70 + round(kb_real[2] * 25))
+        return "REAL NEWS", 100 - real_score, real_score, kb_real, kb_fake
+    if kb_fake and kb_fake[2] >= 0.75:
+        fake_score = min(95, 70 + round(kb_fake[2] * 25))
+        return "FAKE NEWS", fake_score, 100 - fake_score, kb_real, kb_fake
+    strong_fake_hits = sum(1 for p in STRONG_FAKE_SIGNALS if re.search(p, text_lower))
+    strong_real_hits = sum(1 for p in STRONG_REAL_SIGNALS if re.search(p, text_lower))
+    suspicious_hits  = sum(1 for p, _ in SUSPICIOUS_PATTERNS if re.search(p, text_lower))
+    credible_hits    = sum(1 for p, _ in CREDIBLE_PATTERNS   if re.search(p, text_lower))
+    fake_raw  = 50
+    fake_raw += strong_fake_hits * 22
+    fake_raw -= strong_real_hits * 18
+    fake_raw += suspicious_hits  * 8
+    fake_raw -= credible_hits    * 7
+    abs_claims = len(re.findall(r'\b(100%|proven|guaranteed|banned|suppressed|secret|exposed|shocking)\b', text_lower))
+    fake_raw  += abs_claims * 5
+    caps_words = len(re.findall(r'\b[A-Z]{4,}\b', text))
+    fake_raw  += min(caps_words * 3, 15)
+    if len(text.split()) < 8:
+        fake_raw += 5
+    fake_raw = max(5, min(95, fake_raw))
+    real_raw = 100 - fake_raw
+    label    = "FAKE NEWS" if fake_raw > 50 else "REAL NEWS"
+    if kb_real and kb_real[2] >= 0.6:
+        if label == "FAKE NEWS" and fake_raw < 85:
+            label = "REAL NEWS"; real_raw = max(real_raw, 65); fake_raw = 100 - real_raw
+    if kb_fake and kb_fake[2] >= 0.6:
+        if label == "REAL NEWS" and real_raw < 85:
+            label = "FAKE NEWS"; fake_raw = max(fake_raw, 65); real_raw = 100 - fake_raw
+    return label, fake_raw, real_raw, kb_real, kb_fake
+
+
+def check_verified_event(text):
+    text_lower = text.lower()
+    text_clean = re.sub(r'[^\w\s]', ' ', text_lower)
+    best_match, best_score = None, 0
+    for phrase, label, description in VERIFIED_EVENTS_KB:
+        words   = phrase.split()
+        matched = sum(1 for w in words if w in text_clean)
+        score   = matched / len(words)
+        if score > best_score and score >= 0.6:
+            best_score = score; best_match = (description, label, score)
+    return best_match
+
+
+def check_misinformation_kb(text):
+    text_lower = text.lower()
+    text_clean = re.sub(r'[^\w\s]', ' ', text_lower)
+    best_match, best_score = None, 0
+    for phrase, label, description in KNOWN_MISINFORMATION_KB:
+        words   = phrase.split()
+        matched = sum(1 for w in words if w in text_clean)
+        score   = matched / len(words)
+        if score > best_score and score >= 0.65:
+            best_score = score; best_match = (description, label, score)
+    return best_match
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def get_source_favicon(source_name):
+    if not source_name:
+        return ""
+    key = source_name.lower().strip()
+    if key in SOURCE_FAVICONS:
+        return SOURCE_FAVICONS[key]
+    for known, fav in SOURCE_FAVICONS.items():
+        if known in key or key in known:
+            return fav
+    domain = re.sub(r'[^a-z0-9]', '', key)
+    return f"https://www.google.com/s2/favicons?domain={domain}.com&sz=32"
+
+
+def get_source_initials(source_name):
+    if not source_name:
+        return "N"
+    words = source_name.strip().split()
+    if len(words) == 1:
+        return words[0][:2].upper()
+    return (words[0][0] + words[1][0]).upper()
 
 
 def is_hindi(text):
     return sum(1 for c in text if '\u0900' <= c <= '\u097F') > 5
 
+
 def has_debunk_signal(text):
     t = text.lower()
     return any(sig in t for sig in DEBUNK_SIGNALS)
+
 
 def time_ago(published_at):
     if not published_at:
         return ""
     try:
-        pub = datetime.strptime(published_at[:19], "%Y-%m-%dT%H:%M:%S")
+        pub  = datetime.strptime(published_at[:19], "%Y-%m-%dT%H:%M:%S")
         diff = datetime.utcnow() - pub
         hours = int(diff.total_seconds() // 3600)
         if hours < 1:
@@ -1994,7 +1683,7 @@ def time_ago(published_at):
         else:
             d = hours // 24
             return f"{d} day{'s' if d != 1 else ''} ago"
-    except:
+    except Exception:
         return published_at[:10]
 
 
@@ -2006,181 +1695,89 @@ def fetch_wiki_image(page_title):
     try:
         r = requests.get(
             "https://en.wikipedia.org/w/api.php",
-            params={
-                "action":      "query",
-                "titles":      page_title,
-                "prop":        "pageimages",
-                "pithumbsize": 800,
-                "piprop":      "original|thumbnail|name",
-                "format":      "json",
-                "formatversion": "2"
-            },
+            params={"action":"query","titles":page_title,"prop":"pageimages",
+                    "pithumbsize":800,"piprop":"original|thumbnail|name",
+                    "format":"json","formatversion":"2"},
             timeout=7, headers={"User-Agent": "TruthLens/2.0 (educational)"})
         if r.status_code == 200:
-            pages = r.json().get("query", {}).get("pages", [])
-            for page in pages:
-                orig = page.get("original", {})
-                src = orig.get("source", "")
-                if not src:
-                    src = page.get("thumbnail", {}).get("source", "")
+            for page in r.json().get("query",{}).get("pages",[]):
+                src = page.get("original",{}).get("source","") or page.get("thumbnail",{}).get("source","")
                 if src and not any(s in src for s in SKIP):
-                    if "/thumb/" in src:
-                        src = re.sub(r'/\d+px-', '/800px-', src)
-                    return src
-    except:
+                    return re.sub(r'/\d+px-', '/800px-', src) if "/thumb/" in src else src
+    except Exception:
         pass
     try:
         encoded = urllib.parse.quote(page_title.replace(" ", "_"))
-        r = requests.get(
-            f"https://en.wikipedia.org/api/rest_v1/page/summary/{encoded}",
-            timeout=6, headers={"User-Agent": "TruthLens/2.0"})
+        r = requests.get(f"https://en.wikipedia.org/api/rest_v1/page/summary/{encoded}",
+                         timeout=6, headers={"User-Agent": "TruthLens/2.0"})
         if r.status_code == 200:
             data = r.json()
-            src = (data.get("originalimage") or {}).get("source", "")
-            if not src:
-                src = (data.get("thumbnail") or {}).get("source", "")
+            src  = (data.get("originalimage") or {}).get("source","") or (data.get("thumbnail") or {}).get("source","")
             if src and not any(s in src for s in SKIP):
-                if "/thumb/" in src:
-                    src = re.sub(r'/\d+px-', '/800px-', src)
-                return src
-    except:
+                return re.sub(r'/\d+px-', '/800px-', src) if "/thumb/" in src else src
+    except Exception:
         pass
     return ""
 
 
 def fetch_wikipedia_context(claim_keywords, hindi=False, original_text="",
                             kb_match_real=None, kb_match_fake=None):
-    """
-    UPDATED: Guaranteed to always return a Wikipedia result — never empty {}.
-
-    Candidate generation priority (strict):
-    1. detect_event_type() on original text         → event page (highest)
-    2. detect_event_type() on Hindi→English text    → event page (Hindi input)
-    3. resolve_wiki_topic() on original text        → best phrase match
-    4. resolve_wiki_topic() on Hindi→English text   → translated match
-    5. KB fake topic → misinformation wiki page
-    6. First-mentioned known entity                 → person/org page
-    7. Event phrases                                → topic page
-    8. Hindi Wikipedia for same topics              → Hindi version
-    9. Hard fallbacks: "Misinformation", "India", "News media", "Current events"
-       (guaranteed to exist on Wikipedia — never fails)
-
-    CRITICAL: Uses smart_cap() NOT title() — title() corrupts apostrophes and
-    mixed-case names like "ICC Men's T20 World Cup" → "Icc Men'S T20 World Cup".
-    """
-    candidates = []   # list of (wiki_title_str, prefer_hindi_bool)
-    seen_c     = set()
+    candidates, seen_c = [], set()
 
     def _add(title, pref_hi=False):
-        t = (title or "").strip()
+        t  = (title or "").strip()
         tl = t.lower()
         if t and len(t) > 1 and tl not in seen_c:
-            seen_c.add(tl)
-            candidates.append((t, pref_hi))
+            seen_c.add(tl); candidates.append((t, pref_hi))
 
     def _smart_cap(s):
-        """Capitalize only the first character — preserve all other casing.
-        Avoids corrupting titles like "ICC Men's T20 World Cup" or "COVID-19".
-        """
-        if not s:
-            return s
-        return s[0].upper() + s[1:]
+        return s[0].upper() + s[1:] if s else s
 
-    # ── 1. Event detection on ORIGINAL text — always highest priority ─────
     _, event_wiki_orig = detect_event_type(original_text)
     _add(event_wiki_orig, False)
-
-    # ── 2. Hindi → English translation + event detection ─────────────────
-    en_kw      = []
-    en_text    = ""
+    en_kw, en_text = [], ""
     if hindi or is_hindi(original_text):
         en_kw   = _hindi_to_english_keywords(original_text)
         en_text = " ".join(en_kw)
         if en_text:
-            # Run detect_event_type on the translated text too
             _, event_wiki_en = detect_event_type(en_text)
-            # Only add if different from what we already have
             _add(event_wiki_en, False)
-            # IMPORTANT: if original text already gave a good event topic,
-            # the translated version should give the SAME result —
-            # that's the fix for "same news Hindi/English → same Wikipedia"
-
-    # ── 3. resolve_wiki_topic on original text ────────────────────────────
     resolved_orig = resolve_wiki_topic(claim_keywords, original_text)
-    _add(resolved_orig, False)   # always English wiki — more reliable
-
-    # ── 4. resolve_wiki_topic on translated English text ──────────────────
+    _add(resolved_orig, False)
     if en_text:
-        resolved_en = resolve_wiki_topic(en_kw, en_text)
-        _add(resolved_en, False)
-
-    # ── 5. KB fake match → misinformation Wikipedia page ──────────────────
+        _add(resolve_wiki_topic(en_kw, en_text), False)
     if kb_match_fake and kb_match_fake[0]:
-        kb_desc     = kb_match_fake[0]
-        kb_resolved = resolve_wiki_topic([], kb_desc)
-        _add(kb_resolved, False)
-        topic_part = kb_desc.split("—")[0].strip().split("/")[0].strip()
-        _add(topic_part, False)
-
-    # ── 6. First-mentioned known entity ───────────────────────────────────
+        kb_desc = kb_match_fake[0]
+        _add(resolve_wiki_topic([], kb_desc), False)
+        _add(kb_desc.split("—")[0].strip().split("/")[0].strip(), False)
     work_text = en_text if en_text else original_text
     entities  = extract_known_entities(work_text)
     if entities:
         tl_ref = work_text.lower()
-        def _pos(e):
-            p = tl_ref.find(e.lower())
-            return p if p >= 0 else len(work_text)
-        for e in sorted(entities, key=_pos)[:3]:
+        for e in sorted(entities, key=lambda e: tl_ref.find(e.lower()) if tl_ref.find(e.lower()) >= 0 else len(work_text))[:3]:
             _add(e, False)
-
-    # ── 7. Event phrases ──────────────────────────────────────────────────
     for ep in extract_event_phrases(work_text)[:3]:
         _add(ep, False)
-
-    # ── 8. Hindi Wikipedia — only try for genuinely Hindi-named articles ──
-    # Don't blindly add prefer_hindi=True for English Wikipedia titles
-    # (Hindi Wikipedia titles are different from English ones)
     if hindi and candidates:
-        top_title = candidates[0][0]
-        # Only try Hindi wiki if the title has a known Hindi equivalent
-        _add(top_title, True)
-
-    # ── 9. Hard fallbacks — these ALWAYS exist on Wikipedia ───────────────
-    hard_fallbacks = []
-    if kb_match_fake:
-        hard_fallbacks += ["Misinformation", "Fake news", "Conspiracy theory"]
-    if hindi or is_hindi(original_text):
-        hard_fallbacks += ["India", "Indian media", "Hindi"]
-    hard_fallbacks += ["Current events", "News media", "Journalism"]
-    for fb in hard_fallbacks:
+        _add(candidates[0][0], True)
+    for fb in (["Misinformation","Fake news","Conspiracy theory"] if kb_match_fake else []) + \
+              (["India","Indian media","Hindi"] if hindi or is_hindi(original_text) else []) + \
+              ["Current events","News media","Journalism"]:
         _add(fb, False)
 
-    # ── Try each candidate against Wikipedia REST API ─────────────────────
     seen_titles = set()
     for title, prefer_hindi in candidates:
         tl = title.lower().strip()
         if tl in seen_titles or len(tl) < 2:
             continue
         seen_titles.add(tl)
-
-        # For prefer_hindi: try Hindi API first, then English
-        apis_to_try = ([WIKIPEDIA_HI_API, WIKIPEDIA_API] if prefer_hindi
-                       else [WIKIPEDIA_API])
-
-        for api in apis_to_try:
+        apis = [WIKIPEDIA_HI_API, WIKIPEDIA_API] if prefer_hindi else [WIKIPEDIA_API]
+        for api in apis:
             try:
-                is_hi_api = "hi.wikipedia" in api
-                # CRITICAL FIX: use _smart_cap() NOT .title()
-                # .title() corrupts "ICC Men's T20" → "Icc Men'S T20" (broken)
-                # _smart_cap() only capitalizes first letter (correct)
-                if is_hi_api:
-                    search_title = title   # Hindi titles: use as-is
-                else:
-                    search_title = _smart_cap(title)  # English: only first letter up
-
-                r = requests.get(
-                    api + urllib.parse.quote(search_title),
-                    timeout=6, headers={"User-Agent": "TruthLens/2.0"})
+                is_hi_api    = "hi.wikipedia" in api
+                search_title = title if is_hi_api else _smart_cap(title)
+                r = requests.get(api + urllib.parse.quote(search_title),
+                                 timeout=6, headers={"User-Agent": "TruthLens/2.0"})
                 if r.status_code != 200:
                     continue
                 data = r.json()
@@ -2200,34 +1797,24 @@ def fetch_wikipedia_context(claim_keywords, hindi=False, original_text="",
                 extract = data.get("extract", "")
                 return {
                     "title":       page_title_actual,
-                    "extract":     (extract[:500] + "\u2026" if len(extract) > 500 else extract),
+                    "extract":     (extract[:500] + "…" if len(extract) > 500 else extract),
                     "url":         data.get("content_urls", {}).get("desktop", {}).get("page", ""),
                     "image":       image,
                     "description": data.get("description", ""),
                 }
             except Exception:
                 continue
-
-    # ── Absolute last resort — should never reach here ────────────────────
     return {}
 
 
-# ─── NewsAPI with Hindi prioritization ────────────────────────────────────────
+# ─── NewsAPI ──────────────────────────────────────────────────────────────────
 
 def _build_news_queries(claim_text, prediction, for_hindi=False):
-    """
-    Build a prioritised list of NewsAPI query strings.
-    Q1 is ALWAYS the exact event (from detect_event_type) — most specific.
-    Subsequent queries broaden gradually.
-    Hindi input: translates first, then builds English queries.
-    """
-    # For Hindi: translate first so we get proper English queries
     work_text = claim_text
     if is_hindi(claim_text) or for_hindi:
         hi_kw = _hindi_to_english_keywords(claim_text)
         if hi_kw:
             work_text = " ".join(hi_kw)
-
     year          = extract_year(work_text) or extract_year(claim_text)
     _, event_wiki = detect_event_type(work_text) or detect_event_type(claim_text)
     kw            = extract_newsapi_keywords(work_text)
@@ -2240,65 +1827,46 @@ def _build_news_queries(claim_text, prediction, for_hindi=False):
                     seen_w.add(w.lower()); out.append(w)
         return " ".join(out).strip()
 
-    # Build the event-wiki query — strip only true filler, keep key terms
     q_event = ""
     if event_wiki:
-        skip_ew = {"the", "a", "an", "of", "by", "in", "on", "at", "and", "or",
-                   "conspiracy", "misinformation", "theories", "theory", "denial"}
+        skip_ew = {"the","a","an","of","by","in","on","at","and","or","conspiracy","misinformation","theories","theory","denial"}
         ew_words = [w for w in event_wiki.split() if w.lower() not in skip_ew]
-        q_event = " ".join(ew_words[:6])   # keep up to 6 words for specificity
-
+        q_event  = " ".join(ew_words[:6])
     q_main  = _dedup_q(*kw[:4])
     q_short = _dedup_q(*kw[:3])
     q_pair  = _dedup_q(*kw[:2])
-
     if prediction == "FAKE NEWS":
         queries = [
             q_event + " fact check" if q_event else q_main + " fact check",
             q_event + " debunked"   if q_event else q_main + " debunked",
-            q_event or q_main,
-            q_main,
-            q_short + " misinformation",
-            q_pair,
+            q_event or q_main, q_main,
+            q_short + " misinformation", q_pair,
         ]
     else:
-        queries = [
-            q_event or q_main,   # ALWAYS lead with exact event
-            q_main,
-            q_short,
-            q_pair,
-            (q_event or q_main) + " news",
-        ]
-
+        queries = [q_event or q_main, q_main, q_short, q_pair, (q_event or q_main) + " news"]
     if for_hindi:
         queries = [q + " india" if q and "india" not in q.lower() else q for q in queries]
-
-    # Deduplicate while preserving order
     seen_q, clean = set(), []
     for q in queries:
-        q = (q or "").strip()
-        ql = q.lower()
+        q = (q or "").strip(); ql = q.lower()
         if q and len(q) > 3 and ql not in seen_q:
             seen_q.add(ql); clean.append(q)
     return clean
 
 
 def fetch_related_news(claim_text, prediction, all_keywords):
-    hindi = is_hindi(claim_text)
-    # _build_news_queries handles Hindi translation internally now
+    hindi   = is_hindi(claim_text)
     queries = _build_news_queries(claim_text, prediction, for_hindi=False)
+    articles_out, seen_urls = [], set()
 
-    articles_out = []
-    seen_urls    = set()
-
-    def _make_article(a):
-        url         = a.get("url", "")
-        title       = a.get("title") or ""
+    def _make_article(a, idx=0):
+        url   = a.get("url", "")
+        title = a.get("title") or ""
         if not url or url in seen_urls or title in ("[Removed]", "") or not title:
             return None
         seen_urls.add(url)
         desc        = a.get("description") or ""
-        image       = _resolve_article_image(a.get("urlToImage", ""), "", url, title)
+        image       = resolve_article_image(a.get("urlToImage", ""), "", url, title, idx)
         source_name = (a.get("source") or {}).get("name") or ""
         published   = a.get("publishedAt") or ""
         return {
@@ -2314,9 +1882,7 @@ def fetch_related_news(claim_text, prediction, all_keywords):
             "is_debunk":   has_debunk_signal(title + " " + desc),
         }
 
-    # ── PHASE 1 (Hindi): Indian sources with translated queries ───────────
     if hindi:
-        # Use for_hindi=True so _build_news_queries translates + appends "india"
         hi_queries = _build_news_queries(claim_text, prediction, for_hindi=True)
         for q in hi_queries[:4]:
             if len(articles_out) >= 3:
@@ -2333,28 +1899,26 @@ def fetch_related_news(claim_text, prediction, all_keywords):
                         timeout=8).json()
                     if data.get("status") != "ok":
                         continue
-                    for a in data.get("articles", []):
-                        art = _make_article(a)
+                    for i, a in enumerate(data.get("articles", [])):
+                        art = _make_article(a, len(articles_out))
                         if art:
                             articles_out.append(art)
                         if len(articles_out) >= 3:
                             break
                 except Exception:
                     continue
-
-        # ── Hindi Google News RSS (actual Hindi results) ───────────────────
         if len(articles_out) < 3:
-            hi_raw = re.findall(r'[\u0900-\u097F\s]{3,}', claim_text)
+            hi_raw  = re.findall(r'[\u0900-\u097F\s]{3,}', claim_text)
             hi_text = " ".join(hi_raw).strip()[:80] if hi_raw else ""
             for rss_q in ([hi_text] if hi_text else []) + hi_queries[:2]:
                 if len(articles_out) >= 3 or not rss_q:
                     break
                 try:
-                    q_enc  = urllib.parse.quote(rss_q)
-                    r      = requests.get(
+                    q_enc = urllib.parse.quote(rss_q)
+                    r     = requests.get(
                         f"https://news.google.com/rss/search?q={q_enc}&hl=hi-IN&gl=IN&ceid=IN:hi",
                         headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
-                    soup   = BeautifulSoup(r.content, "xml")
+                    soup  = BeautifulSoup(r.content, "xml")
                     for item in soup.find_all("item")[:10]:
                         if len(articles_out) >= 3:
                             break
@@ -2367,27 +1931,26 @@ def fetch_related_news(claim_text, prediction, all_keywords):
                         raw_url = link_el.get_text(strip=True) if link_el else ""
                         if not raw_url:
                             continue
-                        real_url = _resolve_real_url(raw_url)
+                        real_url = _resolve_redirect(raw_url)
                         use_url  = real_url if (real_url and "news.google.com" not in real_url) else raw_url
                         if use_url in seen_urls:
                             continue
                         seen_urls.add(use_url)
-                        rss_img = _rss_item_image(item)
-                        image   = _resolve_article_image("", rss_img,
-                                      real_url if "news.google.com" not in real_url else "", title)
+                        rss_img  = _rss_item_image(item)
+                        image    = resolve_article_image("", rss_img,
+                                       real_url if "news.google.com" not in real_url else "",
+                                       title, len(articles_out))
                         src_name = source_el.get_text(strip=True) if source_el else "Google News"
                         articles_out.append({
                             "title": title, "description": "",
                             "link": use_url, "image": image, "urlToImage": "",
-                            "source": src_name,
-                            "favicon": get_source_favicon(src_name),
+                            "source": src_name, "favicon": get_source_favicon(src_name),
                             "initials": get_source_initials(src_name),
                             "published": "", "is_debunk": has_debunk_signal(title.lower()),
                         })
                 except Exception:
                     pass
 
-    # ── PHASE 2: English NewsAPI — iterate all queries until 6 articles ───
     for q in queries:
         if len(articles_out) >= 6:
             break
@@ -2400,7 +1963,7 @@ def fetch_related_news(claim_text, prediction, all_keywords):
             if data.get("status") != "ok":
                 continue
             for a in data.get("articles", []):
-                art = _make_article(a)
+                art = _make_article(a, len(articles_out))
                 if art:
                     articles_out.append(art)
                 if len(articles_out) >= 6:
@@ -2408,7 +1971,6 @@ def fetch_related_news(claim_text, prediction, all_keywords):
         except Exception:
             continue
 
-    # ── PHASE 3: Google News RSS fallback ────────────────────────────────
     if len(articles_out) < 3:
         lang_param = "hl=hi-IN&gl=IN&ceid=IN:hi" if hindi else "hl=en-IN&gl=IN&ceid=IN:en"
         for rss_q in queries[:3]:
@@ -2432,20 +1994,20 @@ def fetch_related_news(claim_text, prediction, all_keywords):
                     raw_url = link_el.get_text(strip=True) if link_el else ""
                     if not raw_url:
                         continue
-                    real_url = _resolve_real_url(raw_url)
+                    real_url = _resolve_redirect(raw_url)
                     use_url  = real_url if (real_url and "news.google.com" not in real_url) else raw_url
                     if use_url in seen_urls:
                         continue
                     seen_urls.add(use_url)
                     rss_img  = _rss_item_image(item)
-                    image    = _resolve_article_image("", rss_img,
-                                   real_url if "news.google.com" not in real_url else "", title)
+                    image    = resolve_article_image("", rss_img,
+                                   real_url if "news.google.com" not in real_url else "",
+                                   title, len(articles_out))
                     src_name = source_el.get_text(strip=True) if source_el else "Google News"
                     articles_out.append({
                         "title": title, "description": "",
                         "link": use_url, "image": image, "urlToImage": "",
-                        "source": src_name,
-                        "favicon": get_source_favicon(src_name),
+                        "source": src_name, "favicon": get_source_favicon(src_name),
                         "initials": get_source_initials(src_name),
                         "published": "", "is_debunk": has_debunk_signal(title.lower()),
                     })
@@ -2457,48 +2019,30 @@ def fetch_related_news(claim_text, prediction, all_keywords):
 
 
 def fetch_more_articles(claim_text, prediction, all_keywords, exclude_urls=None):
-    """
-    MORE SUPPORTING COVERAGE section.
-    Deliberately uses DIFFERENT query angles from fetch_related_news to avoid
-    showing the same articles twice — focuses on secondary entities, event wiki
-    title, and fact-check/debunk angles for fake news.
-    """
     if exclude_urls is None:
         exclude_urls = set()
-
     hindi         = is_hindi(claim_text)
     year          = extract_year(claim_text)
     _, event_wiki = detect_event_type(claim_text)
     kw            = extract_newsapi_keywords(claim_text)
-
-    # Build queries using DIFFERENT emphasis than fetch_related_news:
-    # - Swap person order (secondary first)
-    # - Use event_wiki title directly
-    # - Add different angles: analysis, explained, latest
-    _people_set    = {x.lower() for x in KNOWN_ENTITIES[:22]}
-    entities       = extract_known_entities(claim_text)
-    persons        = [e for e in entities if e.lower() in _people_set]
-    orgs           = [e for e in entities if e.lower() not in _people_set]
-    second_person  = persons[1] if len(persons) > 1 else (persons[0] if persons else "")
-    primary_org    = orgs[0] if orgs else ""
-
+    _people_set   = {x.lower() for x in KNOWN_ENTITIES[:22]}
+    entities      = extract_known_entities(claim_text)
+    persons       = [e for e in entities if e.lower() in _people_set]
+    orgs          = [e for e in entities if e.lower() not in _people_set]
+    second_person = persons[1] if len(persons) > 1 else (persons[0] if persons else "")
+    primary_org   = orgs[0] if orgs else ""
     q_wiki  = ""
     if event_wiki:
-        skip_ew = {"the","a","an","of","by","in","on","at","and","or","conspiracy",
-                   "misinformation","theories","theory","denial"}
-        ew_w = [w for w in event_wiki.split() if w.lower() not in skip_ew]
-        q_wiki = " ".join(ew_w[:5])
-
+        skip_ew = {"the","a","an","of","by","in","on","at","and","or","conspiracy","misinformation","theories","theory","denial"}
+        q_wiki  = " ".join([w for w in event_wiki.split() if w.lower() not in skip_ew][:5])
     q_main  = " ".join(kw[:3])
     q_short = " ".join(kw[:2])
-
     if prediction == "FAKE NEWS":
         queries = [
             q_wiki + " false" if q_wiki else q_main + " false",
             q_main + " debunked",
             second_person + " " + (year or q_short) if second_person else q_main,
-            q_wiki or q_short,
-            q_main + " fact check",
+            q_wiki or q_short, q_main + " fact check",
             q_short + " hoax" if not q_wiki else q_wiki + " debunked",
         ]
     else:
@@ -2506,56 +2050,45 @@ def fetch_more_articles(claim_text, prediction, all_keywords, exclude_urls=None)
             q_wiki or q_main,
             second_person + " " + (year or "") if second_person else q_short,
             primary_org + " " + (year or "") if primary_org else q_main,
-            q_main + " explained",
-            q_main + " latest",
+            q_main + " explained", q_main + " latest",
             q_short + " " + (year or "news"),
         ]
-
     if hindi:
         hi_kw   = _hindi_to_english_keywords(claim_text)
         hi_main = " ".join(hi_kw[:3]) if hi_kw else q_main
         queries = [hi_main + " india"] + queries
-
-    # Deduplicate queries
     seen_q, clean_q = set(), []
     for q in queries:
-        q = q.strip()
-        ql = q.lower()
+        q = q.strip(); ql = q.lower()
         if q and len(q) > 3 and ql not in seen_q:
             seen_q.add(ql); clean_q.append(q)
-    queries = clean_q
-
+    queries      = clean_q
     articles_out = []
     seen_urls    = set(exclude_urls)
 
-    def _make_article(a):
-        url         = a.get("url", "")
-        title       = a.get("title") or ""
+    def _make_article(a, idx=0):
+        url   = a.get("url", "")
+        title = a.get("title") or ""
         if not url or url in seen_urls or title in ("[Removed]", "") or not title:
             return None
         seen_urls.add(url)
         desc        = a.get("description") or ""
-        image       = _resolve_article_image(a.get("urlToImage", ""), "", url, title)
+        image       = resolve_article_image(a.get("urlToImage", ""), "", url, title, idx)
         source_name = (a.get("source") or {}).get("name") or ""
         published   = a.get("publishedAt") or ""
         return {
             "title":     title,
             "desc":      (desc[:160] + "…") if len(desc) > 160 else desc,
-            "link":      url,
-            "image":     image,
-            "urlToImage": a.get("urlToImage", ""),
-            "source":    source_name,
-            "favicon":   get_source_favicon(source_name),
+            "link":      url, "image": image, "urlToImage": a.get("urlToImage", ""),
+            "source":    source_name, "favicon": get_source_favicon(source_name),
             "initials":  get_source_initials(source_name),
             "published": time_ago(published),
             "is_debunk": has_debunk_signal(title + " " + desc),
         }
 
-    # ── PHASE 1 (Hindi): Indian sources in both languages ─────────────────
     if hindi:
         hi_kw      = _hindi_to_english_keywords(claim_text)
-        hi_queries = _build_news_queries(" ".join(hi_kw) if hi_kw else claim_text,
-                                         prediction, for_hindi=True)
+        hi_queries = _build_news_queries(" ".join(hi_kw) if hi_kw else claim_text, prediction, for_hindi=True)
         for q in hi_queries[:3]:
             if len(articles_out) >= 2:
                 break
@@ -2572,7 +2105,7 @@ def fetch_more_articles(claim_text, prediction, all_keywords, exclude_urls=None)
                     if data.get("status") != "ok":
                         continue
                     for a in data.get("articles", []):
-                        art = _make_article(a)
+                        art = _make_article(a, len(articles_out))
                         if art:
                             articles_out.append(art)
                         if len(articles_out) >= 2:
@@ -2580,7 +2113,6 @@ def fetch_more_articles(claim_text, prediction, all_keywords, exclude_urls=None)
                 except Exception:
                     continue
 
-    # ── PHASE 2: English NewsAPI ──────────────────────────────────────────
     for q in queries:
         if len(articles_out) >= 5:
             break
@@ -2593,7 +2125,7 @@ def fetch_more_articles(claim_text, prediction, all_keywords, exclude_urls=None)
             if data.get("status") != "ok":
                 continue
             for a in data.get("articles", []):
-                art = _make_article(a)
+                art = _make_article(a, len(articles_out))
                 if art:
                     articles_out.append(art)
                 if len(articles_out) >= 5:
@@ -2601,7 +2133,6 @@ def fetch_more_articles(claim_text, prediction, all_keywords, exclude_urls=None)
         except Exception:
             continue
 
-    # ── PHASE 3: Google News RSS fallback ────────────────────────────────
     if len(articles_out) < 3:
         lang_p = "hl=hi-IN&gl=IN&ceid=IN:hi" if hindi else "hl=en-IN&gl=IN&ceid=IN:en"
         for rss_q in queries[:3]:
@@ -2626,7 +2157,7 @@ def fetch_more_articles(claim_text, prediction, all_keywords, exclude_urls=None)
                     raw_url = link_el.get_text(strip=True) if link_el else ""
                     if not raw_url:
                         continue
-                    real_url = _resolve_real_url(raw_url)
+                    real_url = _resolve_redirect(raw_url)
                     use_url  = real_url if (real_url and "news.google.com" not in real_url) else raw_url
                     if use_url in seen_urls:
                         continue
@@ -2642,17 +2173,16 @@ def fetch_more_articles(claim_text, prediction, all_keywords, exclude_urls=None)
                         except Exception:
                             pass
                     rss_img  = _rss_item_image(item)
-                    image    = _resolve_article_image("", rss_img,
-                                   real_url if "news.google.com" not in real_url else "", title)
+                    image    = resolve_article_image("", rss_img,
+                                   real_url if "news.google.com" not in real_url else "",
+                                   title, len(articles_out))
                     src_name = source_el.get_text(strip=True) if source_el else "Google News"
                     articles_out.append({
                         "title": title, "desc": "",
                         "link": use_url, "image": image, "urlToImage": "",
-                        "source": src_name,
-                        "favicon": get_source_favicon(src_name),
+                        "source": src_name, "favicon": get_source_favicon(src_name),
                         "initials": get_source_initials(src_name),
-                        "published": t_ago,
-                        "is_debunk": has_debunk_signal(title.lower()),
+                        "published": t_ago, "is_debunk": has_debunk_signal(title.lower()),
                     })
             except Exception:
                 pass
@@ -2661,21 +2191,12 @@ def fetch_more_articles(claim_text, prediction, all_keywords, exclude_urls=None)
     return articles_out[:5]
 
 
-# ─── Live Twitter via Nitter ──────────────────────────────────────────────────
+# ─── Twitter / Nitter ─────────────────────────────────────────────────────────
 
 def fetch_nitter_discussion(claim_text, keywords, prediction):
-    """
-    Fetches 5 tweets using 5+ focused, news-specific queries from generate_twitter_query().
-    Each query targets a different angle of the story — person, event, year, pair, fact-check.
-    Falls back to clickable Twitter search links using the same diverse queries.
-    """
-    # ── Generate 5-7 focused, diverse queries ────────────────────────────
     twitter_queries = generate_twitter_query(claim_text, keywords, prediction)
+    tweets, seen_txt = [], set()
 
-    tweets   = []
-    seen_txt = set()
-
-    # ── Try Nitter RSS for each query ─────────────────────────────────────
     for query in twitter_queries:
         if len(tweets) >= 5:
             break
@@ -2686,11 +2207,7 @@ def fetch_nitter_discussion(claim_text, keywords, prediction):
                 break
             try:
                 rss_url = f"{instance}/search/rss?q={encoded_q}&f=tweets"
-                r = requests.get(
-                    rss_url,
-                    headers={"User-Agent": "Mozilla/5.0 (compatible; TruthLens/2.0)"},
-                    timeout=5,
-                )
+                r = requests.get(rss_url, headers={"User-Agent": "Mozilla/5.0 (compatible; TruthLens/2.0)"}, timeout=5)
                 if r.status_code != 200:
                     continue
                 soup  = BeautifulSoup(r.content, "xml")
@@ -2707,11 +2224,10 @@ def fetch_nitter_discussion(claim_text, keywords, prediction):
                     creator_el = item.find("dc:creator") or item.find("creator")
                     if not title_el:
                         continue
-                    url = link_el.get_text(strip=True) if link_el else ""
+                    url        = link_el.get_text(strip=True) if link_el else ""
                     tweet_text = ""
                     if desc_el:
-                        raw_desc   = desc_el.get_text(strip=True)
-                        tweet_text = re.sub(r'<[^>]+>', '', raw_desc)[:280]
+                        tweet_text = re.sub(r'<[^>]+>', '', desc_el.get_text(strip=True))[:280]
                     if not tweet_text:
                         tweet_text = title_el.get_text(strip=True)
                     tweet_key = tweet_text[:80].lower()
@@ -2728,46 +2244,33 @@ def fetch_nitter_discussion(claim_text, keywords, prediction):
                             dt   = parsedate_to_datetime(pub)
                             diff = datetime.utcnow() - dt.replace(tzinfo=None)
                             h    = int(diff.total_seconds() // 3600)
-                            t_ago = (f"{int(diff.total_seconds()//60)}m"
-                                     if h < 1 else f"{h}h" if h < 24 else f"{h//24}d")
+                            t_ago = f"{int(diff.total_seconds()//60)}m" if h < 1 else f"{h}h" if h < 24 else f"{h//24}d"
                         except Exception:
                             pass
                     combined     = tweet_text.lower()
                     is_debunk    = has_debunk_signal(combined)
-                    is_spreading = any(w in combined for w in
-                                       ["viral", "spreading", "shares", "retweet",
-                                        "trending", "millions", "shared"])
-                    sentiment = ("debunk" if is_debunk else
-                                 "spreading" if is_spreading else "neutral")
-                    twitter_url = re.sub(
-                        r'https?://(nitter\.[^/]+)', 'https://twitter.com', url
-                    ) if url else ""
+                    is_spreading = any(w in combined for w in ["viral","spreading","shares","retweet","trending","millions","shared"])
+                    sentiment    = "debunk" if is_debunk else "spreading" if is_spreading else "neutral"
+                    twitter_url  = re.sub(r'https?://(nitter\.[^/]+)', 'https://twitter.com', url) if url else ""
                     tweets.append({
-                        "text":       tweet_text,
-                        "username":   username,
-                        "time_ago":   t_ago,
-                        "url":        twitter_url or url,
-                        "nitter_url": url,
-                        "sentiment":  sentiment,
-                        "source":     "nitter",
+                        "text": tweet_text, "username": username, "time_ago": t_ago,
+                        "url": twitter_url or url, "nitter_url": url,
+                        "sentiment": sentiment, "source": "nitter",
                     })
                     fetched_this_query = True
                 if fetched_this_query:
-                    break   # Got results from this instance → move to next query
+                    break
             except Exception:
                 continue
 
-    # ── RSSHub fallback ───────────────────────────────────────────────────
     if len(tweets) < 3:
         for query in twitter_queries[:3]:
             if len(tweets) >= 5:
                 break
             try:
                 q_enc = urllib.parse.quote(query)
-                r = requests.get(
-                    f"https://rsshub.app/twitter/search/{q_enc}",
-                    headers={"User-Agent": "Mozilla/5.0"}, timeout=5,
-                )
+                r = requests.get(f"https://rsshub.app/twitter/search/{q_enc}",
+                                 headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
                 if r.status_code == 200:
                     soup = BeautifulSoup(r.content, "xml")
                     for item in soup.find_all("item")[:10]:
@@ -2800,19 +2303,13 @@ def fetch_nitter_discussion(claim_text, keywords, prediction):
                                 pass
                         is_debunk = has_debunk_signal(tweet_text.lower())
                         tweets.append({
-                            "text":       tweet_text,
-                            "username":   username,
-                            "time_ago":   t_ago,
-                            "url":        url,
-                            "nitter_url": url,
-                            "sentiment":  "debunk" if is_debunk else "neutral",
-                            "source":     "nitter",
+                            "text": tweet_text, "username": username, "time_ago": t_ago,
+                            "url": url, "nitter_url": url,
+                            "sentiment": "debunk" if is_debunk else "neutral", "source": "nitter",
                         })
             except Exception:
                 pass
 
-    # ── Search-link fallback — one link per query, up to 5 total ─────────
-    # Always fill to 5 using clickable Twitter/X search links
     seen_search = set(t.get("search_query", "") for t in tweets)
     for query_str in twitter_queries:
         if len(tweets) >= 5:
@@ -2820,154 +2317,110 @@ def fetch_nitter_discussion(claim_text, keywords, prediction):
         if query_str in seen_search:
             continue
         seen_search.add(query_str)
-        twitter_search_url = (
-            "https://twitter.com/search?q="
-            + urllib.parse.quote(query_str)
-            + "&src=typed_query&f=live"
-        )
+        twitter_search_url = ("https://twitter.com/search?q=" +
+                              urllib.parse.quote(query_str) + "&src=typed_query&f=live")
         tweets.append({
-            "text":           f"Search Twitter/X for: {query_str}",
-            "username":       "@TwitterSearch",
-            "time_ago":       "live",
-            "url":            twitter_search_url,
-            "nitter_url":     twitter_search_url,
-            "sentiment":      "neutral",
-            "badge":          "🔍 SEARCH",
-            "source":         "search",
-            "search_query":   query_str,
-            "is_search_link": True,
+            "text": f"Search Twitter/X for: {query_str}", "username": "@TwitterSearch",
+            "time_ago": "live", "url": twitter_search_url, "nitter_url": twitter_search_url,
+            "sentiment": "neutral", "badge": "🔍 SEARCH", "source": "search",
+            "search_query": query_str, "is_search_link": True,
         })
 
     if prediction == "FAKE NEWS":
         tweets.sort(key=lambda t: 0 if t["sentiment"] == "debunk" else 1)
-
     return tweets[:5]
 
 
-
-
-# ─── Live Reddit Posts ────────────────────────────────────────────────────────
+# ─── Reddit ───────────────────────────────────────────────────────────────────
 
 def fetch_reddit_posts(claim_text, all_keywords, prediction, kb_match_fake=None):
     kw = [k for k in all_keywords if all(ord(c) < 128 for c in k)][:5]
     if not kw:
         kw = extract_newsapi_keywords(claim_text)
     query_parts = kw[:4]
-
     if prediction == "FAKE NEWS":
-        base_q = " ".join(query_parts[:3])
-        queries = [
-            base_q,
-            " ".join(query_parts[:2]),
-            kw[0] if kw else claim_text[:40],
-        ]
+        base_q  = " ".join(query_parts[:3])
+        queries = [base_q, " ".join(query_parts[:2]), kw[0] if kw else claim_text[:40]]
         if kb_match_fake and kb_match_fake[0]:
             kb_topic = kb_match_fake[0].split("—")[0].strip()[:60]
             if kb_topic:
                 queries.insert(0, kb_topic)
-        subreddits = ["r/worldnews", "r/Snopes", "r/skeptic",
-                      "r/factcheck", "r/politics", "r/news", "r/india"]
+        subreddits = ["r/worldnews","r/Snopes","r/skeptic","r/factcheck","r/politics","r/news","r/india"]
     else:
-        queries = [" ".join(query_parts), " ".join(query_parts[:3])]
-        subreddits = ["r/worldnews", "r/news", "r/india",
-                      "r/technology", "r/science", "r/cricket"]
-
-    posts = []
-    seen  = set()
+        queries    = [" ".join(query_parts), " ".join(query_parts[:3])]
+        subreddits = ["r/worldnews","r/news","r/india","r/technology","r/science","r/cricket"]
+    posts, seen = [], set()
     headers = {"User-Agent": "TruthLens/2.0 (fake-news-detector)", "Accept": "application/json"}
-
     for q in queries[:2]:
         if len(posts) >= 5:
             break
         try:
-            search_url = f"https://www.reddit.com/search.json?q={urllib.parse.quote(q)}&sort=relevance&limit=15&t=year"
-            r = requests.get(search_url, headers=headers, timeout=8)
+            r = requests.get(
+                f"https://www.reddit.com/search.json?q={urllib.parse.quote(q)}&sort=relevance&limit=15&t=year",
+                headers=headers, timeout=8)
             if r.status_code == 200:
-                data = r.json()
-                for child in data.get("data", {}).get("children", []):
+                for child in r.json().get("data",{}).get("children",[]):
                     if len(posts) >= 5:
                         break
-                    p = child.get("data", {})
-                    title = p.get("title", "")
-                    permalink = p.get("permalink", "")
-                    url = "https://www.reddit.com" + permalink if permalink else p.get("url", "")
-                    subreddit = p.get("subreddit_name_prefixed", "r/news")
-                    score = p.get("score", 0)
-                    num_comments = p.get("num_comments", 0)
-                    created_utc = p.get("created_utc", 0)
-                    selftext = p.get("selftext", "")[:200]
-                    is_debunk = has_debunk_signal((title + " " + selftext).lower())
+                    p         = child.get("data",{})
+                    title     = p.get("title","")
+                    permalink = p.get("permalink","")
+                    url       = "https://www.reddit.com" + permalink if permalink else p.get("url","")
                     if not title or title in seen:
                         continue
                     seen.add(title)
+                    created_utc = p.get("created_utc",0)
                     t_ago = ""
                     if created_utc:
                         diff = datetime.utcnow() - datetime.utcfromtimestamp(created_utc)
-                        h = int(diff.total_seconds() // 3600)
-                        t_ago = (f"{int(diff.total_seconds()//60)}m" if h < 1
-                                 else f"{h}h" if h < 24 else f"{h//24}d")
+                        h    = int(diff.total_seconds() // 3600)
+                        t_ago = f"{int(diff.total_seconds()//60)}m" if h < 1 else f"{h}h" if h < 24 else f"{h//24}d"
                     posts.append({
-                        "title":        title,
-                        "text":         selftext,
-                        "subreddit":    subreddit,
-                        "score":        score,
-                        "num_comments": num_comments,
-                        "url":          url,
-                        "time_ago":     t_ago,
-                        "is_debunk":    is_debunk,
-                        "source":       "reddit",
+                        "title": title, "text": p.get("selftext","")[:200],
+                        "subreddit": p.get("subreddit_name_prefixed","r/news"),
+                        "score": p.get("score",0), "num_comments": p.get("num_comments",0),
+                        "url": url, "time_ago": t_ago,
+                        "is_debunk": has_debunk_signal((title + " " + p.get("selftext","")).lower()),
+                        "source": "reddit",
                     })
         except Exception:
             pass
-
     if len(posts) < 3:
         for sr in subreddits[:3]:
             if len(posts) >= 5:
                 break
             try:
-                q = " ".join(query_parts[:3])
+                q   = " ".join(query_parts[:3])
                 url = f"https://www.reddit.com/{sr}/search.json?q={urllib.parse.quote(q)}&restrict_sr=1&sort=relevance&limit=8"
-                r = requests.get(url, headers=headers, timeout=6)
+                r   = requests.get(url, headers=headers, timeout=6)
                 if r.status_code == 200:
-                    data = r.json()
-                    for child in data.get("data", {}).get("children", []):
+                    for child in r.json().get("data",{}).get("children",[]):
                         if len(posts) >= 5:
                             break
-                        p = child.get("data", {})
-                        title = p.get("title", "")
-                        permalink = p.get("permalink", "")
-                        post_url = "https://www.reddit.com" + permalink if permalink else ""
-                        subreddit = p.get("subreddit_name_prefixed", sr)
-                        score = p.get("score", 0)
-                        num_comments = p.get("num_comments", 0)
-                        created_utc = p.get("created_utc", 0)
-                        is_debunk = has_debunk_signal(title.lower())
+                        p         = child.get("data",{})
+                        title     = p.get("title","")
+                        permalink = p.get("permalink","")
+                        post_url  = "https://www.reddit.com" + permalink if permalink else ""
                         if not title or title in seen:
                             continue
                         seen.add(title)
+                        created_utc = p.get("created_utc",0)
                         t_ago = ""
                         if created_utc:
                             diff = datetime.utcnow() - datetime.utcfromtimestamp(created_utc)
-                            h = int(diff.total_seconds() // 3600)
-                            t_ago = (f"{int(diff.total_seconds()//60)}m" if h < 1
-                                     else f"{h}h" if h < 24 else f"{h//24}d")
+                            h    = int(diff.total_seconds() // 3600)
+                            t_ago = f"{int(diff.total_seconds()//60)}m" if h < 1 else f"{h}h" if h < 24 else f"{h//24}d"
                         posts.append({
-                            "title":        title,
-                            "text":         "",
-                            "subreddit":    subreddit,
-                            "score":        score,
-                            "num_comments": num_comments,
-                            "url":          post_url,
-                            "time_ago":     t_ago,
-                            "is_debunk":    is_debunk,
-                            "source":       "reddit",
+                            "title": title, "text": "",
+                            "subreddit": p.get("subreddit_name_prefixed",sr),
+                            "score": p.get("score",0), "num_comments": p.get("num_comments",0),
+                            "url": post_url, "time_ago": t_ago,
+                            "is_debunk": has_debunk_signal(title.lower()), "source": "reddit",
                         })
             except Exception:
                 continue
-
     if prediction == "FAKE NEWS":
         posts.sort(key=lambda p: 0 if p["is_debunk"] else 1)
-
     return posts[:5]
 
 
@@ -2981,9 +2434,9 @@ def fetch_google_factchecks(query):
             timeout=6)
         results = []
         for item in r.json().get("claims", []):
-            review = item.get("claimReview", [{}])[0]
-            rating = review.get("textualRating", "")
-            rl     = rating.lower()
+            review    = item.get("claimReview", [{}])[0]
+            rating    = review.get("textualRating", "")
+            rl        = rating.lower()
             rating_type = (
                 "false" if any(w in rl for w in ["false","fake","misleading","pants on fire","incorrect","fabricated","wrong"])
                 else "true" if any(w in rl for w in ["true","correct","accurate","verified","mostly true"])
@@ -2991,17 +2444,16 @@ def fetch_google_factchecks(query):
             )
             publisher = review.get("publisher", {}).get("name", "")
             results.append({
-                "claim":       item.get("text", "")[:200],
-                "claimant":    item.get("claimant", "Unknown"),
-                "rating":      rating,
-                "rating_type": rating_type,
-                "url":         review.get("url", ""),
+                "claim":       item.get("text","")[:200],
+                "claimant":    item.get("claimant","Unknown"),
+                "rating":      rating, "rating_type": rating_type,
+                "url":         review.get("url",""),
                 "publisher":   publisher,
                 "favicon":     get_source_favicon(publisher),
                 "initials":    get_source_initials(publisher),
             })
         return results[:5]
-    except:
+    except Exception:
         return []
 
 
@@ -3026,6 +2478,7 @@ Respond ONLY in this exact JSON format, no markdown, no extra text:
   "recommendation": "<one sentence advice>"
 }}"""
 
+
 def _parse_verdict(raw):
     if not raw:
         return {}
@@ -3043,23 +2496,16 @@ def _parse_verdict(raw):
     except json.JSONDecodeError:
         try:
             json_str = re.sub(r',(\s*\n\s*[}\]])', r'\1', json_str)
-            parsed = json.loads(json_str)
-        except:
+            parsed   = json.loads(json_str)
+        except Exception:
             return {}
     v = str(parsed.get("verdict", "UNCERTAIN")).upper().strip()
-    if "FAKE" in v:
-        v = "LIKELY FAKE"
-    elif "REAL" in v or "TRUE" in v or "ACCURATE" in v:
-        v = "LIKELY REAL"
-    elif "MISLEAD" in v:
-        v = "MISLEADING"
-    else:
-        v = "UNCERTAIN"
-    parsed["verdict"] = v
-    parsed["verdict_type"] = (
-        "fake" if "FAKE" in v else "real" if "REAL" in v else
-        "misleading" if "MISLEAD" in v else "uncertain"
-    )
+    if "FAKE" in v:       v = "LIKELY FAKE"
+    elif "REAL" in v or "TRUE" in v or "ACCURATE" in v: v = "LIKELY REAL"
+    elif "MISLEAD" in v:  v = "MISLEADING"
+    else:                 v = "UNCERTAIN"
+    parsed["verdict"]      = v
+    parsed["verdict_type"] = ("fake" if "FAKE" in v else "real" if "REAL" in v else "misleading" if "MISLEAD" in v else "uncertain")
     parsed.setdefault("red_flags", [])
     parsed.setdefault("credibility_signals", [])
     parsed.setdefault("recommendation", "")
@@ -3067,9 +2513,10 @@ def _parse_verdict(raw):
     parsed.setdefault("confidence", 50)
     try:
         parsed["confidence"] = max(0, min(100, int(parsed["confidence"])))
-    except:
+    except Exception:
         parsed["confidence"] = 50
     return parsed
+
 
 def fetch_groq_verdict(claim_text, prediction, fake_prob, real_prob):
     try:
@@ -3088,11 +2535,12 @@ def fetch_groq_verdict(claim_text, prediction, fake_prob, real_prob):
         result = _parse_verdict(data["choices"][0]["message"]["content"])
         if not result:
             return {}
-        result["provider"] = "Groq Llama 3.3-70b"
+        result["provider"]      = "Groq Llama 3.3-70b"
         result["provider_icon"] = "groq"
         return result
     except Exception:
         return {}
+
 
 def fetch_cohere_verdict(claim_text, prediction, fake_prob, real_prob):
     try:
@@ -3115,11 +2563,12 @@ def fetch_cohere_verdict(claim_text, prediction, fake_prob, real_prob):
         result = _parse_verdict(raw)
         if not result:
             return {}
-        result["provider"] = "Cohere Command R"
+        result["provider"]      = "Cohere Command R"
         result["provider_icon"] = "cohere"
         return result
     except Exception:
         return {}
+
 
 def build_consensus(verdicts):
     active = [v for v in verdicts if v]
@@ -3129,11 +2578,9 @@ def build_consensus(verdicts):
     top_type  = verdict_counts.most_common(1)[0][0]
     top_count = verdict_counts.most_common(1)[0][1]
     avg_conf  = round(sum(v.get("confidence", 50) for v in active) / len(active))
-    verdict_label = {
-        "fake": "LIKELY FAKE", "real": "LIKELY REAL",
-        "misleading": "MISLEADING", "uncertain": "UNCERTAIN",
-    }.get(top_type, "UNCERTAIN")
-    total = len(active)
+    verdict_label = {"fake": "LIKELY FAKE", "real": "LIKELY REAL",
+                     "misleading": "MISLEADING", "uncertain": "UNCERTAIN"}.get(top_type, "UNCERTAIN")
+    total     = len(active)
     agreement = (f"All {total} AIs agree" if top_count == total
                  else f"{top_count}/{total} AIs agree" if top_count > total / 2
                  else "AIs are divided")
@@ -3158,16 +2605,16 @@ def analyze_patterns(text):
             credible.append(label)
     return suspicious, credible
 
+
 def credibility_analysis(prediction, fake_prob, real_prob, news_results, suspicious,
                          credible, fact_checks, kb_match_real, kb_match_fake):
     model_score = (100 - fake_prob) if prediction == "FAKE NEWS" else real_prob
-    n = len(news_results)
-    news_score = {0: 15, 1: 35, 2: 50, 3: 65}.get(min(n, 3), 80)
-    lang_adj   = (len(credible) * 6) - (len(suspicious) * 5)
-    fc_adj     = sum(-18 if fc["rating_type"] == "false" else
-                     15 if fc["rating_type"] == "true" else 2 for fc in fact_checks)
-    kb_adj     = 25 if kb_match_real else (-20 if kb_match_fake else 0)
-    combined   = (model_score * 0.55) + (news_score * 0.25) + lang_adj + fc_adj + kb_adj
+    n           = len(news_results)
+    news_score  = {0: 15, 1: 35, 2: 50, 3: 65}.get(min(n, 3), 80)
+    lang_adj    = (len(credible) * 6) - (len(suspicious) * 5)
+    fc_adj      = sum(-18 if fc["rating_type"] == "false" else 15 if fc["rating_type"] == "true" else 2 for fc in fact_checks)
+    kb_adj      = 25 if kb_match_real else (-20 if kb_match_fake else 0)
+    combined    = (model_score * 0.55) + (news_score * 0.25) + lang_adj + fc_adj + kb_adj
     if fake_prob > 80 and len(suspicious) >= 2:
         combined -= 15
     if real_prob > 80 and len(credible) >= 2:
@@ -3176,11 +2623,13 @@ def credibility_analysis(prediction, fake_prob, real_prob, news_results, suspici
         combined += 10
     return max(5, min(98, round(combined)))
 
+
 def get_risk_level(credibility):
     if credibility >= 75:   return "LOW RISK",      "#00ff88"
     elif credibility >= 50: return "MODERATE RISK", "#ffcc00"
     elif credibility >= 25: return "HIGH RISK",      "#ff8800"
     else:                   return "CRITICAL RISK",  "#ff3355"
+
 
 def build_explanation(prediction, suspicious, credible, confidence, fake_prob, real_prob,
                       n_news, fact_checks, kb_match_real, kb_match_fake):
@@ -3189,7 +2638,6 @@ def build_explanation(prediction, suspicious, credible, confidence, fake_prob, r
         parts.append(f"✓ Verified real-world event in knowledge base: {kb_match_real[0]}")
     elif kb_match_fake:
         parts.append(f"⚠ Matches known misinformation pattern: {kb_match_fake[0]}")
-
     if prediction == "FAKE NEWS":
         parts.append(f"Scoring system flags this as FAKE with {fake_prob}% probability.")
         if suspicious:
@@ -3204,7 +2652,6 @@ def build_explanation(prediction, suspicious, credible, confidence, fake_prob, r
             parts.append(f"Minor concerns: {', '.join(suspicious)}.")
         if n_news >= 2:
             parts.append(f"{n_news} corroborating sources found.")
-
     if fact_checks:
         fc_names = list({fc["publisher"] for fc in fact_checks if fc["publisher"]})
         ratings  = [fc["rating"] for fc in fact_checks if fc["rating"]]
@@ -3223,29 +2670,27 @@ async def home(request: Request):
         "fake_rate": fake_rate, "history": scan_history[-5:][::-1],
     })
 
+
 @app.post("/predict", response_class=HTMLResponse)
 async def predict(request: Request, text: str = Form(...)):
     start = time.time()
-    text = text.strip()
+    text  = text.strip()
     if not text:
         raise HTTPException(status_code=400, detail="No text provided")
 
     label, fake_prob, real_prob, kb_match_real, kb_match_fake = score_claim(text)
-
-    confidence = max(fake_prob, real_prob)
-    hindi      = is_hindi(text)
+    confidence   = max(fake_prob, real_prob)
+    hindi        = is_hindi(text)
     all_keywords = extract_keywords(text)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        f_related  = executor.submit(fetch_related_news,      text, label, all_keywords)
-        f_fc       = executor.submit(fetch_google_factchecks, text[:200])
-        f_wiki     = executor.submit(fetch_wikipedia_context, all_keywords, hindi, text,
-                                     kb_match_real, kb_match_fake)
-        f_nitter   = executor.submit(fetch_nitter_discussion, text, all_keywords, label)
-        f_reddit   = executor.submit(fetch_reddit_posts,      text, all_keywords, label,
-                                     kb_match_fake)
-        f_groq     = executor.submit(fetch_groq_verdict,      text, label, fake_prob, real_prob)
-        f_cohere   = executor.submit(fetch_cohere_verdict,    text, label, fake_prob, real_prob)
+        f_related = executor.submit(fetch_related_news,      text, label, all_keywords)
+        f_fc      = executor.submit(fetch_google_factchecks, text[:200])
+        f_wiki    = executor.submit(fetch_wikipedia_context, all_keywords, hindi, text, kb_match_real, kb_match_fake)
+        f_nitter  = executor.submit(fetch_nitter_discussion, text, all_keywords, label)
+        f_reddit  = executor.submit(fetch_reddit_posts,      text, all_keywords, label, kb_match_fake)
+        f_groq    = executor.submit(fetch_groq_verdict,      text, label, fake_prob, real_prob)
+        f_cohere  = executor.submit(fetch_cohere_verdict,    text, label, fake_prob, real_prob)
 
         related_news   = f_related.result()
         fact_checks    = f_fc.result()
@@ -3257,8 +2702,7 @@ async def predict(request: Request, text: str = Form(...)):
 
     used_urls     = {a["link"] for a in related_news}
     more_articles = fetch_more_articles(text, label, all_keywords, exclude_urls=used_urls)
-
-    consensus = build_consensus([groq_verdict, cohere_verdict])
+    consensus     = build_consensus([groq_verdict, cohere_verdict])
 
     suspicious, credible = analyze_patterns(text)
     credibility          = credibility_analysis(label, fake_prob, real_prob, related_news,
@@ -3267,8 +2711,8 @@ async def predict(request: Request, text: str = Form(...)):
     risk_level, risk_color = get_risk_level(credibility)
     explanation = build_explanation(label, suspicious, credible, confidence, fake_prob, real_prob,
                                     len(related_news), fact_checks, kb_match_real, kb_match_fake)
-    elapsed = round((time.time() - start) * 1000)
-    query   = urllib.parse.quote(text[:120])
+    elapsed   = round((time.time() - start) * 1000)
+    query     = urllib.parse.quote(text[:120])
 
     stats["total"] += 1
     if label == "FAKE NEWS":
@@ -3287,12 +2731,11 @@ async def predict(request: Request, text: str = Form(...)):
 
     fake_rate = round((stats["fake"] / stats["total"]) * 100)
 
-    for a in related_news + more_articles:
+    # Final image safety pass — ensure every article has a valid image
+    for idx, a in enumerate(related_news + more_articles):
         img = a.get("image", "")
-        if img and not _is_clean_image(img):
-            a["image"] = _make_fallback_image(a.get("title", ""))
-        elif not img:
-            a["image"] = _make_fallback_image(a.get("title", ""))
+        if not img or not _is_clean_image(img):
+            a["image"] = _make_fallback_image(a.get("title", ""), idx)
 
     return templates.TemplateResponse("index.html", {
         "request":        request,
@@ -3328,6 +2771,7 @@ async def predict(request: Request, text: str = Form(...)):
         "fake_rate":      fake_rate,
         "history":        scan_history[-5:][::-1],
     })
+
 
 @app.get("/api/stats")
 async def api_stats():
