@@ -9,15 +9,13 @@
   <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,300&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/static/style.css" />
   <style>
-    /* ── Image card fix: image sits ON TOP of placeholder, covers it fully ── */
+    /* ── Image card: image sits on top of placeholder ── */
     .news-card-image-wrap,
     .more-article-img-wrap {
       position: relative;
       overflow: hidden;
       background: #0d1117;
     }
-
-    /* Placeholder always behind */
     .ncard-placeholder {
       position: absolute;
       inset: 0;
@@ -29,42 +27,27 @@
       z-index: 1;
       pointer-events: none;
     }
-
-    /* Image always on top — covers placeholder when it loads */
-    .news-card-img,
-    .more-article-img {
+    /* Background-image div used by JS loader */
+    .card-bg-img {
       position: absolute;
       inset: 0;
-      width: 100%;
-      height: 100%;
-      object-fit: cover;
       z-index: 2;
-      display: block;
-      transition: opacity 0.3s ease;
+      background-size: cover;
+      background-position: center;
+      background-repeat: no-repeat;
+      opacity: 0;
+      transition: opacity 0.35s ease;
     }
+    .card-bg-img.loaded  { opacity: 1; }
+    .card-bg-img.errored { opacity: 0; z-index: 0; }
 
-    /* Badges always on top of image */
+    /* Badges always on top */
     .news-card-debunk-badge,
     .news-card-source-chip,
     .more-article-debunk-badge,
     .more-article-src-chip {
       position: relative;
-      z-index: 3;
-    }
-
-    /* Image loading state */
-    .news-card-img.img-loading,
-    .more-article-img.img-loading {
-      opacity: 0;
-    }
-    .news-card-img.img-loaded,
-    .more-article-img.img-loaded {
-      opacity: 1;
-    }
-    .news-card-img.img-error,
-    .more-article-img.img-error {
-      opacity: 0;
-      z-index: 0; /* send behind placeholder on error */
+      z-index: 4;
     }
   </style>
 </head>
@@ -288,7 +271,6 @@
   {% if prediction %}
   <section class="results-section" id="results">
 
-    <!-- 1. KB Match Banner -->
     {% if kb_match_real %}
     <div class="kb-banner kb-banner--real">
       <span class="kb-icon">✓</span>
@@ -309,7 +291,6 @@
     </div>
     {% endif %}
 
-    <!-- 2. Verdict Banner -->
     <div class="verdict-banner verdict-banner--{{ 'fake' if prediction == 'FAKE NEWS' else 'real' }}">
       <div class="verdict-left">
         <div class="verdict-icon">{{ '✕' if prediction == 'FAKE NEWS' else '✓' }}</div>
@@ -329,7 +310,6 @@
       <div class="scanned-text">"{{ text }}"</div>
     </div>
 
-    <!-- 3. Metrics -->
     <div class="metrics-grid">
       <div class="metric-card">
         <div class="metric-title">◈ PROBABILITY BREAKDOWN</div>
@@ -415,7 +395,6 @@
     </div>
     {% endif %}
 
-    <!-- Wikipedia Context -->
     {% if wiki_context %}
     <a href="{{ wiki_context.url }}" target="_blank" rel="noopener" class="wiki-card">
       <div class="wiki-card-inner">
@@ -444,7 +423,6 @@
     </a>
     {% endif %}
 
-    <!-- 4. AI PANEL -->
     {% if groq_verdict or cohere_verdict %}
     <div class="ai-panel-section">
       <div class="section-title">
@@ -455,7 +433,6 @@
         Two independent AI models analyse the claim and deliver a combined consensus
       </div>
       <div class="ai-cards-grid ai-cards-grid--two">
-
         {% if groq_verdict %}
         <div class="ai-card ai-card--{{ groq_verdict.verdict_type }}">
           <div class="ai-card-header">
@@ -482,7 +459,6 @@
           <div class="ai-card-offline-msg">⚠ Groq did not respond. May be rate-limited.</div>
         </div>
         {% endif %}
-
         {% if cohere_verdict %}
         <div class="ai-card ai-card--{{ cohere_verdict.verdict_type }}">
           <div class="ai-card-header">
@@ -509,9 +485,7 @@
           <div class="ai-card-offline-msg">⚠ Cohere did not respond this time.</div>
         </div>
         {% endif %}
-
       </div>
-
       {% if consensus %}
       <div class="consensus-card consensus-card--{{ consensus.verdict_type }}">
         <div class="consensus-header">
@@ -530,7 +504,6 @@
     </div>
     {% endif %}
 
-    <!-- 5. Related News Articles -->
     {% if related_news %}
     <div class="related-news-section">
       <div class="section-title">
@@ -544,24 +517,16 @@
       <div class="related-news-grid">
         {% for article in related_news %}
         <a href="{{ article.link }}" target="_blank" rel="noopener noreferrer" class="news-card">
-          <div class="news-card-image-wrap" data-source="{{ article.source }}"
-            style="position:relative;overflow:hidden;background:#0d1117;"
-            id="wrap-{{ loop.index }}">
-            <!-- Placeholder: always visible as base -->
+          <div class="news-card-image-wrap" style="position:relative;overflow:hidden;background:#0d1117;">
             <div class="ncard-placeholder" style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;z-index:1;">
               <span class="ncard-initials">{{ article.initials }}</span>
               <span class="ncard-source-label">{{ article.source or 'News' }}</span>
             </div>
-            <!-- Background image div: covers placeholder when image loads -->
-            <div id="img-{{ loop.index }}"
-              style="position:absolute;inset:0;z-index:2;background-size:cover;background-position:center;background-repeat:no-repeat;opacity:0;transition:opacity 0.35s ease;"
+            <div class="card-bg-img"
               data-src="{{ article.image }}"
-              data-link="{{ article.link }}"
-              data-title="{{ article.title }}"
-              data-fallback="">
-            </div>
-            {% if article.is_debunk %}<span class="news-card-debunk-badge" style="position:relative;z-index:4;">FACT CHECK</span>{% endif %}
-            <div class="news-card-source-chip" style="position:relative;z-index:4;">
+              data-fallback="{{ article.source or '' }}"></div>
+            {% if article.is_debunk %}<span class="news-card-debunk-badge">FACT CHECK</span>{% endif %}
+            <div class="news-card-source-chip">
               {% if article.favicon %}<img src="{{ article.favicon }}" alt="" width="12" height="12" onerror="this.style.display='none'" class="news-card-source-favicon-img"/>{% endif %}
               <span class="news-card-source-name">{{ article.source or 'News' }}</span>
             </div>
@@ -580,7 +545,6 @@
     </div>
     {% endif %}
 
-    <!-- 6. Twitter / X Live Discussion -->
     {% if nitter_tweets %}
     {% set has_real_tweets = nitter_tweets[0].source != 'search' %}
     <div class="social-section nitter-section">
@@ -655,9 +619,7 @@
                 </span>
               </div>
               <div class="nitter-text">{{ tweet.text }}</div>
-              <div class="nitter-footer-row">
-                <span class="nitter-via">View on Twitter/X →</span>
-              </div>
+              <div class="nitter-footer-row"><span class="nitter-via">View on Twitter/X →</span></div>
             </div>
           </div>
         </a>
@@ -667,7 +629,6 @@
     </div>
     {% endif %}
 
-    <!-- 7. Reddit Posts -->
     {% if reddit_posts %}
     <div class="social-section reddit-section">
       <div class="section-title">
@@ -719,7 +680,6 @@
     </div>
     {% endif %}
 
-    <!-- 8. More Supporting/Debunking Articles -->
     {% if more_articles %}
     <div class="more-articles-section">
       <div class="section-title">
@@ -733,24 +693,16 @@
       <div class="more-articles-grid">
         {% for article in more_articles %}
         <a href="{{ article.link }}" target="_blank" rel="noopener" class="more-article-card {% if article.is_debunk %}more-article-card--debunk{% endif %}">
-          <div class="more-article-img-wrap" data-source="{{ article.source }}"
-            style="position:relative;overflow:hidden;background:#0d1117;"
-            id="mwrap-{{ loop.index }}">
-            <!-- Placeholder base -->
+          <div class="more-article-img-wrap" style="position:relative;overflow:hidden;background:#0d1117;">
             <div class="ncard-placeholder" style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;z-index:1;">
               <span class="ncard-initials">{{ article.initials }}</span>
               <span class="ncard-source-label">{{ article.source or 'News' }}</span>
             </div>
-            <!-- Background image div -->
-            <div id="mimg-{{ loop.index }}"
-              style="position:absolute;inset:0;z-index:2;background-size:cover;background-position:center;background-repeat:no-repeat;opacity:0;transition:opacity 0.35s ease;"
+            <div class="card-bg-img"
               data-src="{{ article.image }}"
-              data-link="{{ article.link }}"
-              data-title="{{ article.title }}"
-              data-fallback="">
-            </div>
-            {% if article.is_debunk %}<span class="more-article-debunk-badge" style="position:relative;z-index:4;">FACT CHECK</span>{% endif %}
-            <div class="more-article-src-chip" style="position:relative;z-index:4;">
+              data-fallback="{{ article.source or '' }}"></div>
+            {% if article.is_debunk %}<span class="more-article-debunk-badge">FACT CHECK</span>{% endif %}
+            <div class="more-article-src-chip">
               {% if article.favicon %}<img src="{{ article.favicon }}" alt="" width="11" height="11" onerror="this.style.display='none'" />{% endif %}
               <span>{{ article.source or 'News' }}</span>
             </div>
@@ -769,7 +721,6 @@
     </div>
     {% endif %}
 
-    <!-- 9. Verify Further -->
     <div class="factcheck-section">
       <div class="section-title">◈ VERIFY FURTHER</div>
       <div class="factcheck-row">
@@ -794,9 +745,7 @@
         </div>
         <div class="history-text-wrap">
           <div class="history-text">{{ item.text }}</div>
-          <div class="history-label-tag history-label-tag--{{ 'fake' if item.label == 'FAKE NEWS' else 'real' }}">
-            {{ item.label }}
-          </div>
+          <div class="history-label-tag history-label-tag--{{ 'fake' if item.label == 'FAKE NEWS' else 'real' }}">{{ item.label }}</div>
         </div>
         <div class="history-meta">
           <span class="history-conf">{{ item.confidence }}%</span>
@@ -866,174 +815,51 @@
   {% endif %}
 
   /* ══ IMAGE LOADER ══════════════════════════════════════════════════
-     3-tier pipeline per card:
-       1. data-src (urlToImage from NewsAPI) → best, try first
-       2. Microlink API → fetches real OG image from article URL
-          (free, no auth, runs from their servers, not ours)
-       3. Topic-specific Wikimedia fallback → always relevant
+     Backend already resolved OG/Twitter/JSON-LD images and stored them
+     in article.image. The frontend just needs to:
+       1. Load data-src as background-image
+       2. Fade it in when loaded
+       3. Keep placeholder visible on error (backend fallback is already topic-relevant)
+     No Microlink call needed from frontend — backend handles scraping.
   ════════════════════════════════════════════════════════════════════ */
 
-  function setBg(el, src) {
-    el.style.backgroundImage = 'url(' + src + ')';
-    el.style.opacity = '1';
-  }
-
-  /* Smart topic fallback — reads article title and picks relevant image */
-  /* ── Topic fallback images — Wikimedia Commons direct URLs ────────
-     These are REAL topic-relevant images, not random stock photos.
-     Multiple URLs per topic — rotated by card index for variety.
-     Wikimedia never blocks hotlinking and images are permanent.
-  ─────────────────────────────────────────────────────────────── */
-  const TOPIC_IMAGES = {
-    war: [
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/4/4f/Kharkiv_after_Russian_bombardment%2C_2022.jpg/800px-Kharkiv_after_Russian_bombardment%2C_2022.jpg',
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/4/49/Flag_of_Ukraine.svg/800px-Flag_of_Ukraine.svg.png',
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/f/f3/Flag_of_Russia.svg/800px-Flag_of_Russia.svg.png',
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/3/37/Flag_of_NATO.svg/800px-Flag_of_NATO.svg.png',
-    ],
-    mideast: [
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/d/d4/Flag_of_Israel.svg/800px-Flag_of_Israel.svg.png',
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/0/00/Flag_of_Palestine.svg/800px-Flag_of_Palestine.svg.png',
-    ],
-    politics: [
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/5/56/Donald_Trump_official_portrait.jpg/800px-Donald_Trump_official_portrait.jpg',
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/1/1a/US_Capitol_Building_at_night_Jan_2006.jpg/800px-US_Capitol_Building_at_night_Jan_2006.jpg',
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/6/68/Joe_Biden_presidential_portrait.jpg/800px-Joe_Biden_presidential_portrait.jpg',
-    ],
-    space: [
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/b/b4/Chandrayaan-3_spacecraft.jpg/800px-Chandrayaan-3_spacecraft.jpg',
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/e/e1/FullMoon2010.jpg/800px-FullMoon2010.jpg',
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/9/9e/Milky_Way_Arch.jpg/800px-Milky_Way_Arch.jpg',
-    ],
-    sports: [
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/5/59/Cricket_pictogram.svg/800px-Cricket_pictogram.svg.png',
-    ],
-    tech: [
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/0/04/ChatGPT_logo.svg/800px-ChatGPT_logo.svg.png',
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/f/fa/Apple_logo_black.svg/800px-Apple_logo_black.svg.png',
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/3/34/Elon_Musk_Royal_Society_%28crop2%29.jpg/800px-Elon_Musk_Royal_Society_%28crop2%29.jpg',
-    ],
-    finance: [
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/4/46/Bitcoin.svg/800px-Bitcoin.svg.png',
-    ],
-    health: [
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/8/82/SARS-CoV-2_without_background.png/800px-SARS-CoV-2_without_background.png',
-    ],
-    climate: [
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/9/97/The_Earth_seen_from_Apollo_17.jpg/800px-The_Earth_seen_from_Apollo_17.jpg',
-    ],
-    factcheck: [
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/3/38/Info_Simple_bw.svg/800px-Info_Simple_bw.svg.png',
-    ],
-    india: [
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/4/41/Flag_of_India.svg/800px-Flag_of_India.svg.png',
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/c/c0/Narendra_Modi_-_2014_%28cropped%29.jpg/800px-Narendra_Modi_-_2014_%28cropped%29.jpg',
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/5/5d/India_-_Delhi_-_039_-_parliament_building_%283982455416%29.jpg/800px-India_-_Delhi_-_039_-_parliament_building_%283982455416%29.jpg',
-    ],
-    news: [
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/1/1a/US_Capitol_Building_at_night_Jan_2006.jpg/800px-US_Capitol_Building_at_night_Jan_2006.jpg',
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/9/97/The_Earth_seen_from_Apollo_17.jpg/800px-The_Earth_seen_from_Apollo_17.jpg',
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/9/9e/Milky_Way_Arch.jpg/800px-Milky_Way_Arch.jpg',
-    ],
-  };
-
-  function getTopicFallback(title, index) {
-    const t = (title || '').toLowerCase();
-    let topic = 'news';
-    if (/ukraine|russia|putin|zelensky|nato|troops|missile|invasion|frontline|war|conflict/.test(t))         topic = 'war';
-    else if (/israel|gaza|hamas|palestine/.test(t))                                                           topic = 'mideast';
-    else if (/trump|biden|kamala|election|president|democrat|republican|capitol|senate|white house/.test(t))  topic = 'politics';
-    else if (/isro|chandrayaan|gaganyaan|nasa|space|moon|rocket|satellite|lunar|orbit|spacecraft|astronaut/.test(t)) topic = 'space';
-    else if (/cricket|ipl|t20|rohit|kohli|world cup|stadium|olympic|tournament/.test(t))                      topic = 'sports';
-    else if (/chatgpt|openai|artificial|deepmind|alphafold|tech|google|apple|microsoft|musk|tesla|5g|cyber|digital|software/.test(t)) topic = 'tech';
-    else if (/economy|stock|market|bitcoin|crypto|inflation|finance|bank|gdp|budget|sensex|nifty|rupee/.test(t)) topic = 'finance';
-    else if (/covid|corona|vaccine|pandemic|virus|health|hospital|doctor|disease|medicine|mpox/.test(t))       topic = 'health';
-    else if (/climate|environment|flood|earthquake|cyclone|drought|pollution/.test(t))                         topic = 'climate';
-    else if (/fake|fact.check|misinformation|debunk|hoax|conspiracy|misleading/.test(t))                       topic = 'factcheck';
-    else if (/india|modi|delhi|mumbai|bjp|parliament|lok sabha/.test(t))                                       topic = 'india';
-    const arr = TOPIC_IMAGES[topic] || TOPIC_IMAGES.news;
-    return arr[Math.abs(index) % arr.length];
-  }
-
-  /* ── Reject definite junk images ────────────────────────────────── */
-  function isBadImage(url) {
+  function isBadSrc(url) {
     if (!url || !url.startsWith('http')) return true;
     const u = url.toLowerCase();
-    return ['favicon','1x1','pixel','spacer','placeholder','no-image',
-            'noimage','sprite','news.google.com','google.com/s2',
-            'unsplash.com','pexels.com','pixabay.com','shutterstock',
-            'gettyimages','istockphoto','stock.adobe'].some(b => u.includes(b));
+    return ['favicon','1x1','pixel','spacer','tracking','beacon',
+            'news.google.com','google.com/s2'].some(b => u.includes(b));
   }
 
-  /* ── Known sites that serve generic landscape/stock OG images ───────
-     For these, skip Microlink and go straight to topic fallback.
-     Britannica/PBS/Statista/ScoopWhoop all use decorative photography.
-  ─────────────────────────────────────────────────────────────────── */
-  const GENERIC_OG_SITES = [
-    'britannica.com', 'statista.com', 'pewresearch.org',
-    'cfr.org', 'un.org', 'who.int', 'worldbank.org',
-    'imf.org', 'brookings.edu', 'rand.org', 'csis.org',
-    'foreignaffairs.com', 'foreignpolicy.com', 'chathamhouse.org',
-    'carnegieendowment.org', 'wilsoncenter.org', 'usip.org',
-    'pbs.org', 'scoopwhoop.com', 'theatlantic.com',
-    'newyorker.com', 'smithsonianmag.com', 'nationalgeographic.com',
-    'history.com', 'thoughtco.com', 'worldatlas.com',
-    'infoplease.com', 'reference.com',
-  ];
-
-  function isGenericOgSite(url) {
-    try {
-      const host = new URL(url).hostname.replace(/^www\./, '');
-      return GENERIC_OG_SITES.some(d => host === d || host.endsWith('.' + d));
-    } catch(e) { return false; }
-  }
-
-  /* ── Microlink API — fetches real OG image from article page ────── */
-  function fetchViaLink(articleUrl, el, fallback) {
-    if (!articleUrl || articleUrl.includes('news.google.com') || isGenericOgSite(articleUrl)) {
-      setBg(el, fallback); return;
+  function loadCardImage(el) {
+    const src = (el.dataset.src || '').trim();
+    if (!src || isBadSrc(src)) {
+      // Keep placeholder (already styled) — no image to show
+      return;
     }
-    const api = 'https://api.microlink.io/?url=' + encodeURIComponent(articleUrl)
-              + '&meta=false&screenshot=false';
-    fetch(api, { signal: AbortSignal.timeout(8000) })
-      .then(r => r.ok ? r.json() : Promise.reject())
-      .then(data => {
-        const img_url = data?.data?.image?.url || '';
-        if (img_url && !isBadImage(img_url) && !isGenericOgSite(img_url)) {
-          const img = new Image();
-          img.onload  = () => setBg(el, img_url);
-          img.onerror = () => setBg(el, fallback);
-          img.src = img_url;
-        } else {
-          setBg(el, fallback);
-        }
-      })
-      .catch(() => setBg(el, fallback));
+
+    // Test the image by creating an off-screen Image object
+    const img = new Image();
+
+    img.onload = function() {
+      // Image loaded successfully — set as background and fade in
+      el.style.backgroundImage = 'url(' + src + ')';
+      el.classList.add('loaded');
+    };
+
+    img.onerror = function() {
+      // Image failed (CORS / 404 / etc.) — keep placeholder
+      el.classList.add('errored');
+    };
+
+    img.src = src;
   }
 
-  /* ── Main loader ─────────────────────────────────────────────────── */
-  function loadBgImage(el, index) {
-    const src      = (el.dataset.src   || '').trim();
-    const artUrl   = (el.dataset.link  || '').trim();
-    const title    = (el.dataset.title || '').trim();
-    const fallback = getTopicFallback(title, index);
-
-    if (src && !isBadImage(src)) {
-      /* NewsAPI gave us a urlToImage — try it first */
-      const img = new Image();
-      img.onload  = () => setBg(el, src);
-      img.onerror = () => fetchViaLink(artUrl, el, fallback);
-      img.src = src;
-    } else {
-      /* No urlToImage → try Microlink unless site is known to use generic OG images */
-      fetchViaLink(artUrl, el, fallback);
-    }
-  }
-
-  /* Run on all image divs after DOM is ready */
+  // Run on all card background-image divs after DOM ready
   document.addEventListener('DOMContentLoaded', function() {
-    document.querySelectorAll('[data-src]').forEach(function(el, index) {
-      loadBgImage(el, index);
+    document.querySelectorAll('.card-bg-img').forEach(function(el) {
+      loadCardImage(el);
     });
   });
 </script>
+</body>
+</html>
