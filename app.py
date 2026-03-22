@@ -2334,93 +2334,308 @@ def fetch_nitter_discussion(claim_text, keywords, prediction):
 # ─── Reddit ───────────────────────────────────────────────────────────────────
 
 def fetch_reddit_posts(claim_text, all_keywords, prediction, kb_match_fake=None):
+    """
+    Robust Reddit post fetcher — always returns posts.
+
+    Pipeline (stops as soon as we have 5 posts):
+      1. Reddit JSON API  — global search, multiple User-Agents, all queries
+      2. Reddit JSON API  — per-subreddit search (restrict_sr=1)
+      3. Reddit RSS feed  — /search.rss (no auth needed, different rate-limit bucket)
+      4. Google News RSS  — "site:reddit.com <query>" (always works)
+      5. Guaranteed fallback — static clickable Reddit search links so UI never empty
+    """
     kw = [k for k in all_keywords if all(ord(c) < 128 for c in k)][:5]
     if not kw:
         kw = extract_newsapi_keywords(claim_text)
+    # Also pull from event detection for better queries
+    _, event_wiki = detect_event_type(claim_text)
+    if event_wiki and not kw:
+        skip_ew = {"the","a","an","of","by","in","on","at","and","or","conspiracy","misinformation","theories","theory","denial"}
+        kw = [w for w in event_wiki.split() if w.lower() not in skip_ew][:4]
+
     query_parts = kw[:4]
+    q_main  = " ".join(query_parts[:3])
+    q_short = " ".join(query_parts[:2])
+    q_one   = kw[0] if kw else claim_text[:40]
+
     if prediction == "FAKE NEWS":
-        base_q  = " ".join(query_parts[:3])
-        queries = [base_q, " ".join(query_parts[:2]), kw[0] if kw else claim_text[:40]]
+        queries = [q_main, q_short, q_one, q_main + " debunked", q_main + " fake"]
         if kb_match_fake and kb_match_fake[0]:
             kb_topic = kb_match_fake[0].split("—")[0].strip()[:60]
             if kb_topic:
                 queries.insert(0, kb_topic)
-        subreddits = ["r/worldnews","r/Snopes","r/skeptic","r/factcheck","r/politics","r/news","r/india"]
+        subreddits = ["worldnews", "Snopes", "skeptic", "factcheck", "politics", "news", "india", "conspiracy"]
     else:
-        queries    = [" ".join(query_parts), " ".join(query_parts[:3])]
-        subreddits = ["r/worldnews","r/news","r/india","r/technology","r/science","r/cricket"]
-    posts, seen = [], set()
-    headers = {"User-Agent": "TruthLens/2.0 (fake-news-detector)", "Accept": "application/json"}
-    for q in queries[:2]:
+        queries    = [q_main, q_short, q_one, q_main + " news", q_short + " latest"]
+        subreddits = ["worldnews", "news", "india", "technology", "science", "cricket", "geopolitics", "investing"]
+
+    # Remove empty/duplicate queries
+    seen_q, clean_queries = set(), []
+    for q in queries:
+        q = q.strip()
+        if q and q.lower() not in seen_q:
+            seen_q.add(q.lower()); clean_queries.append(q)
+    queries = clean_queries
+
+    posts, seen_titles = [], set()
+
+    # ── Multiple User-Agents to avoid Reddit blocking one ─────────────────
+    REDDIT_UA_POOL = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "TruthLens/2.0 (educational fake-news detector; contact vineet@example.com)",
+        "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/115.0",
+    ]
+
+    def _reddit_headers(ua_index=0):
+        return {
+            "User-Agent": REDDIT_UA_POOL[ua_index % len(REDDIT_UA_POOL)],
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+
+    def _parse_reddit_child(child, fallback_subreddit="r/news"):
+        p         = child.get("data", {})
+        title     = p.get("title", "")
+        permalink = p.get("permalink", "")
+        url       = "https://www.reddit.com" + permalink if permalink else p.get("url", "")
+        if not title or not url or title in seen_titles:
+            return None
+        seen_titles.add(title)
+        created_utc = p.get("created_utc", 0)
+        t_ago = ""
+        if created_utc:
+            diff = datetime.utcnow() - datetime.utcfromtimestamp(created_utc)
+            h    = int(diff.total_seconds() // 3600)
+            t_ago = (f"{int(diff.total_seconds()//60)}m" if h < 1
+                     else f"{h}h" if h < 24 else f"{h // 24}d")
+        selftext = p.get("selftext", "")[:200]
+        return {
+            "title":        title,
+            "text":         selftext,
+            "subreddit":    p.get("subreddit_name_prefixed", fallback_subreddit),
+            "score":        p.get("score", 0),
+            "num_comments": p.get("num_comments", 0),
+            "url":          url,
+            "time_ago":     t_ago,
+            "is_debunk":    has_debunk_signal((title + " " + selftext).lower()),
+            "source":       "reddit",
+        }
+
+    # ── PHASE 1: Reddit JSON global search — try all queries + UA rotation ──
+    for qi, q in enumerate(queries):
         if len(posts) >= 5:
             break
-        try:
-            r = requests.get(
-                f"https://www.reddit.com/search.json?q={urllib.parse.quote(q)}&sort=relevance&limit=15&t=year",
-                headers=headers, timeout=8)
-            if r.status_code == 200:
-                for child in r.json().get("data",{}).get("children",[]):
-                    if len(posts) >= 5:
-                        break
-                    p         = child.get("data",{})
-                    title     = p.get("title","")
-                    permalink = p.get("permalink","")
-                    url       = "https://www.reddit.com" + permalink if permalink else p.get("url","")
-                    if not title or title in seen:
-                        continue
-                    seen.add(title)
-                    created_utc = p.get("created_utc",0)
-                    t_ago = ""
-                    if created_utc:
-                        diff = datetime.utcnow() - datetime.utcfromtimestamp(created_utc)
-                        h    = int(diff.total_seconds() // 3600)
-                        t_ago = f"{int(diff.total_seconds()//60)}m" if h < 1 else f"{h}h" if h < 24 else f"{h//24}d"
-                    posts.append({
-                        "title": title, "text": p.get("selftext","")[:200],
-                        "subreddit": p.get("subreddit_name_prefixed","r/news"),
-                        "score": p.get("score",0), "num_comments": p.get("num_comments",0),
-                        "url": url, "time_ago": t_ago,
-                        "is_debunk": has_debunk_signal((title + " " + p.get("selftext","")).lower()),
-                        "source": "reddit",
-                    })
-        except Exception:
-            pass
-    if len(posts) < 3:
-        for sr in subreddits[:3]:
+        for ua_i in range(2):  # try 2 different User-Agents per query
             if len(posts) >= 5:
                 break
             try:
-                q   = " ".join(query_parts[:3])
-                url = f"https://www.reddit.com/{sr}/search.json?q={urllib.parse.quote(q)}&restrict_sr=1&sort=relevance&limit=8"
-                r   = requests.get(url, headers=headers, timeout=6)
-                if r.status_code == 200:
-                    for child in r.json().get("data",{}).get("children",[]):
-                        if len(posts) >= 5:
-                            break
-                        p         = child.get("data",{})
-                        title     = p.get("title","")
-                        permalink = p.get("permalink","")
-                        post_url  = "https://www.reddit.com" + permalink if permalink else ""
-                        if not title or title in seen:
-                            continue
-                        seen.add(title)
-                        created_utc = p.get("created_utc",0)
-                        t_ago = ""
-                        if created_utc:
-                            diff = datetime.utcnow() - datetime.utcfromtimestamp(created_utc)
-                            h    = int(diff.total_seconds() // 3600)
-                            t_ago = f"{int(diff.total_seconds()//60)}m" if h < 1 else f"{h}h" if h < 24 else f"{h//24}d"
-                        posts.append({
-                            "title": title, "text": "",
-                            "subreddit": p.get("subreddit_name_prefixed",sr),
-                            "score": p.get("score",0), "num_comments": p.get("num_comments",0),
-                            "url": post_url, "time_ago": t_ago,
-                            "is_debunk": has_debunk_signal(title.lower()), "source": "reddit",
-                        })
+                r = requests.get(
+                    f"https://www.reddit.com/search.json"
+                    f"?q={urllib.parse.quote(q)}&sort=relevance&limit=20&t=year",
+                    headers=_reddit_headers(qi + ua_i),
+                    timeout=8,
+                )
+                if r.status_code == 429:
+                    time.sleep(0.5)  # brief back-off on rate limit
+                    continue
+                if r.status_code != 200:
+                    continue
+                for child in r.json().get("data", {}).get("children", []):
+                    if len(posts) >= 5:
+                        break
+                    post = _parse_reddit_child(child)
+                    if post:
+                        posts.append(post)
+                if posts:
+                    break  # got results from this query — move to next
             except Exception:
                 continue
+
+    # ── PHASE 2: Per-subreddit search ─────────────────────────────────────
+    if len(posts) < 5:
+        for si, sr in enumerate(subreddits):
+            if len(posts) >= 5:
+                break
+            q = q_main or q_short or q_one
+            try:
+                r = requests.get(
+                    f"https://www.reddit.com/r/{sr}/search.json"
+                    f"?q={urllib.parse.quote(q)}&restrict_sr=1&sort=relevance&limit=10&t=year",
+                    headers=_reddit_headers(si),
+                    timeout=7,
+                )
+                if r.status_code not in (200, 429):
+                    continue
+                if r.status_code == 429:
+                    time.sleep(0.3)
+                    continue
+                for child in r.json().get("data", {}).get("children", []):
+                    if len(posts) >= 5:
+                        break
+                    post = _parse_reddit_child(child, f"r/{sr}")
+                    if post:
+                        posts.append(post)
+            except Exception:
+                continue
+
+    # ── PHASE 3: Reddit RSS feed — different rate-limit bucket ───────────
+    if len(posts) < 3:
+        for q in queries[:3]:
+            if len(posts) >= 5:
+                break
+            try:
+                rss_url = f"https://www.reddit.com/search.rss?q={urllib.parse.quote(q)}&sort=relevance&limit=10"
+                r = requests.get(
+                    rss_url,
+                    headers={"User-Agent": REDDIT_UA_POOL[2]},
+                    timeout=7,
+                )
+                if r.status_code != 200:
+                    continue
+                soup = BeautifulSoup(r.content, "xml")
+                for entry in soup.find_all("entry")[:10]:
+                    if len(posts) >= 5:
+                        break
+                    title_el   = entry.find("title")
+                    link_el    = entry.find("link")
+                    content_el = entry.find("content") or entry.find("summary")
+                    category_el= entry.find("category")
+                    updated_el = entry.find("updated")
+                    if not title_el:
+                        continue
+                    title = title_el.get_text(strip=True)
+                    if title in seen_titles:
+                        continue
+                    seen_titles.add(title)
+                    url   = (link_el.get("href","") if link_el else "").strip()
+                    if not url:
+                        continue
+                    subreddit_label = "r/" + (category_el.get("term","news") if category_el else "news")
+                    t_ago = ""
+                    if updated_el:
+                        try:
+                            dt   = datetime.strptime(updated_el.get_text(strip=True)[:19], "%Y-%m-%dT%H:%M:%S")
+                            diff = datetime.utcnow() - dt
+                            h    = int(diff.total_seconds() // 3600)
+                            t_ago = f"{h}h" if h < 24 else f"{h//24}d"
+                        except Exception:
+                            pass
+                    selftext = ""
+                    if content_el:
+                        selftext = re.sub(r'<[^>]+>', '', content_el.get_text(strip=True))[:200]
+                    posts.append({
+                        "title":        title,
+                        "text":         selftext,
+                        "subreddit":    subreddit_label,
+                        "score":        0,
+                        "num_comments": 0,
+                        "url":          url,
+                        "time_ago":     t_ago,
+                        "is_debunk":    has_debunk_signal((title + " " + selftext).lower()),
+                        "source":       "reddit_rss",
+                    })
+            except Exception:
+                continue
+
+    # ── PHASE 4: Google News RSS  "site:reddit.com <query>" ─────────────
+    # This never fails — Google News always has Reddit results
+    if len(posts) < 3:
+        for q in queries[:2]:
+            if len(posts) >= 5:
+                break
+            try:
+                google_q = urllib.parse.quote(f"site:reddit.com {q}")
+                r = requests.get(
+                    f"https://news.google.com/rss/search?q={google_q}&hl=en-IN&gl=IN&ceid=IN:en",
+                    headers={"User-Agent": "Mozilla/5.0"}, timeout=7,
+                )
+                if r.status_code != 200:
+                    continue
+                soup = BeautifulSoup(r.content, "xml")
+                for item in soup.find_all("item")[:10]:
+                    if len(posts) >= 5:
+                        break
+                    title_el  = item.find("title")
+                    link_el   = item.find("link")
+                    pub_el    = item.find("pubDate")
+                    if not title_el:
+                        continue
+                    title = title_el.get_text(strip=True)
+                    # Strip " - r/subreddit" suffix Google News adds
+                    subreddit_label = "r/worldnews"
+                    sr_match = re.search(r'[-–]\s*(r/\w+)', title)
+                    if sr_match:
+                        subreddit_label = sr_match.group(1)
+                        title = title[:sr_match.start()].strip()
+                    if title in seen_titles:
+                        continue
+                    seen_titles.add(title)
+                    raw_url  = link_el.get_text(strip=True) if link_el else ""
+                    real_url = _resolve_redirect(raw_url) if raw_url else ""
+                    use_url  = real_url if (real_url and "news.google.com" not in real_url) else raw_url
+                    if not use_url:
+                        continue
+                    t_ago = ""
+                    if pub_el:
+                        try:
+                            dt   = parsedate_to_datetime(pub_el.get_text(strip=True))
+                            diff = datetime.utcnow() - dt.replace(tzinfo=None)
+                            h    = int(diff.total_seconds() // 3600)
+                            t_ago = f"{h}h" if h < 24 else f"{h//24}d"
+                        except Exception:
+                            pass
+                    posts.append({
+                        "title":        title,
+                        "text":         "",
+                        "subreddit":    subreddit_label,
+                        "score":        0,
+                        "num_comments": 0,
+                        "url":          use_url,
+                        "time_ago":     t_ago,
+                        "is_debunk":    has_debunk_signal(title.lower()),
+                        "source":       "google_reddit",
+                    })
+            except Exception:
+                continue
+
+    # ── PHASE 5: Guaranteed fallback — clickable Reddit search links ──────
+    # UI will ALWAYS show something — never an empty Reddit section
+    if len(posts) < 3:
+        FALLBACK_SUBREDDITS = [
+            ("r/worldnews",  "World news discussions"),
+            ("r/news",       "General news discussions"),
+            ("r/factcheck",  "Fact-checking community"),
+            ("r/skeptic",    "Skeptics community"),
+            ("r/india",      "India news & discussions"),
+        ]
+        for sr_name, sr_desc in FALLBACK_SUBREDDITS:
+            if len(posts) >= 5:
+                break
+            search_q   = q_main or q_one
+            search_url = (
+                f"https://www.reddit.com/{sr_name}/search"
+                f"?q={urllib.parse.quote(search_q)}&restrict_sr=1&sort=relevance"
+            )
+            fallback_title = f'Search "{search_q}" in {sr_name}'
+            if fallback_title in seen_titles:
+                continue
+            seen_titles.add(fallback_title)
+            posts.append({
+                "title":        fallback_title,
+                "text":         f"Click to find Reddit discussions about this topic in {sr_name} — {sr_desc}.",
+                "subreddit":    sr_name,
+                "score":        0,
+                "num_comments": 0,
+                "url":          search_url,
+                "time_ago":     "",
+                "is_debunk":    False,
+                "source":       "fallback",
+            })
+
     if prediction == "FAKE NEWS":
         posts.sort(key=lambda p: 0 if p["is_debunk"] else 1)
+
     return posts[:5]
 
 
