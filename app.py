@@ -2,8 +2,8 @@
 from fastapi import FastAPI, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
+from jinja2 import Environment, FileSystemLoader
 import urllib.parse
 from urllib.parse import urljoin, urlparse
 import requests
@@ -19,7 +19,21 @@ import math
 
 app = FastAPI()
 
-templates = Jinja2Templates(directory="templates")
+# ── FIX: bypass broken Starlette Jinja2Templates cache ──────────────────────
+_jinja_env = Environment(loader=FileSystemLoader("templates"), autoescape=True)
+_jinja_env.globals = {}
+
+class _Templates:
+    def __init__(self, env):
+        self.env = env
+    def TemplateResponse(self, name, context):
+        template = self.env.get_template(name)
+        content  = template.render(**context)
+        return HTMLResponse(content=content)
+
+templates = _Templates(_jinja_env)
+# ─────────────────────────────────────────────────────────────────────────────
+
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 scan_history = []
@@ -507,11 +521,6 @@ STOPWORDS_EN = {
     "first","last","next","top","best","big","biggest","huge","massive",
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ══ ROBUST THUMBNAIL EXTRACTION SYSTEM ══════════════════════════════════════
-# Priority: og:image/og:image:secure_url → twitter:image → JSON-LD → largest img
-# ─────────────────────────────────────────────────────────────────────────────
-
 _BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -526,7 +535,6 @@ _BROWSER_HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
-# Patterns in image URLs/alt text indicating non-article images
 _SKIP_PATTERNS = [
     'logo', 'icon', 'sprite', 'favicon', 'avatar', 'placeholder',
     'blank', 'pixel', 'spacer', 'badge', 'button', 'profile',
@@ -536,7 +544,6 @@ _SKIP_PATTERNS = [
     'google.com/s2', 'news.google.com', 'gravatar', 'disqus',
 ]
 
-# Domains that always serve generic/stock OG images — skip scraping
 _SKIP_SCRAPE_DOMAINS = {
     "ft.com", "wsj.com", "bloomberg.com", "britannica.com",
     "statista.com", "pewresearch.org", "cfr.org", "un.org",
@@ -547,56 +554,31 @@ _SKIP_SCRAPE_DOMAINS = {
 
 
 def _is_valid_image_url(src: str, base_url: str = "") -> str:
-    """
-    Validates and normalises an image URL.
-    - Converts relative URLs to absolute using base_url
-    - Skips SVGs, data URIs, known bad patterns
-    - Returns cleaned URL string or "" if invalid
-    """
     if not src:
         return ""
     src = src.strip()
-
-    # Convert protocol-relative
     if src.startswith("//"):
         src = "https:" + src
-
-    # Convert relative URLs to absolute
     if base_url and not src.startswith("http"):
         src = urljoin(base_url, src)
-
     if not src.startswith("http"):
         return ""
-
     sl = src.lower()
-
-    # Skip SVGs (usually icons/logos)
     if sl.endswith(".svg") or ".svg?" in sl or ".svg#" in sl:
         return ""
-
-    # Skip data URIs
     if sl.startswith("data:"):
         return ""
-
-    # Skip known bad patterns
     if any(skip in sl for skip in _SKIP_PATTERNS):
         return ""
-
-    # Skip tiny images embedded in URL dimensions (e.g. /48x48/ or _32x32.)
     dm = re.search(r'[/_\-](\d{1,3})x(\d{1,3})[/_\-.]', src)
     if dm:
         w, h = int(dm.group(1)), int(dm.group(2))
         if w < 200 or h < 150:
             return ""
-
     return src
 
 
 def _get_image_score(img_tag, base_url: str) -> tuple:
-    """
-    Scores an <img> tag for likelihood of being the article's hero image.
-    Returns (score, src_url). Higher score = better candidate.
-    """
     src = (
         img_tag.get("src") or
         img_tag.get("data-src") or
@@ -609,21 +591,16 @@ def _get_image_score(img_tag, base_url: str) -> tuple:
     src = _is_valid_image_url(src, base_url)
     if not src:
         return (0, "")
-
-    score = 10  # base score
-
-    # Explicit width/height — bigger = better
+    score = 10
     try:
         w = int(img_tag.get("width") or 0)
         h = int(img_tag.get("height") or 0)
         if w and h:
             if w < 200 or h < 150:
-                return (0, "")  # too small
-            score += min(w * h // 10000, 50)  # up to +50 for large images
+                return (0, "")
+            score += min(w * h // 10000, 50)
     except (ValueError, TypeError):
         pass
-
-    # Article-related URL fragments boost score
     ARTICLE_HINTS = (
         "article", "news", "story", "content", "media", "photo",
         "image", "upload", "cdn", "img", "picture", "featured",
@@ -631,13 +608,9 @@ def _get_image_score(img_tag, base_url: str) -> tuple:
     sl = src.lower()
     if any(hint in sl for hint in ARTICLE_HINTS):
         score += 20
-
-    # Alt text quality
     alt = (img_tag.get("alt") or "").lower()
     if alt and len(alt) > 5 and not any(skip in alt for skip in _SKIP_PATTERNS):
         score += 10
-
-    # Class name hints
     cls = " ".join(img_tag.get("class") or []).lower()
     GOOD_CLASSES = ("featured", "hero", "article", "post", "thumbnail", "cover", "main")
     BAD_CLASSES  = ("logo", "icon", "avatar", "author", "social", "ad", "sponsor")
@@ -645,36 +618,14 @@ def _get_image_score(img_tag, base_url: str) -> tuple:
         score += 15
     if any(c in cls for c in BAD_CLASSES):
         return (0, "")
-
-    # Penalise very short URLs (likely generated placeholders)
     if len(src) < 30:
         score -= 5
-
     return (score, src)
 
 
 def extract_thumbnail(url: str) -> str:
-    """
-    Robust article thumbnail extractor.
-
-    Priority order:
-      1. og:image:secure_url  (most reliable)
-      2. og:image
-      3. twitter:image:src / twitter:image
-      4. JSON-LD  (schema.org Article/NewsArticle image field)
-      5. Best scored <img> in article body
-
-    Features:
-      - Caches results for 1 hour (THUMBNAIL_CACHE)
-      - Converts relative → absolute URLs (urljoin)
-      - Skips logos/icons/avatars/sprites/tiny images
-      - 5-second timeout, proper User-Agent
-      - Safe fallback: returns "" (caller decides placeholder)
-    """
     if not url or not url.startswith("http"):
         return ""
-
-    # ── Cache check ───────────────────────────────────────────────────────
     cached = THUMBNAIL_CACHE.get(url)
     if cached and (time.time() - cached["ts"]) < CACHE_EXPIRY_SECONDS:
         return cached.get("image", "")
@@ -683,75 +634,52 @@ def extract_thumbnail(url: str) -> str:
         THUMBNAIL_CACHE[url] = {"image": img, "ts": time.time()}
         return img
 
-    # ── Skip known paywalled / stock-image domains ────────────────────────
     try:
         host = urlparse(url).netloc.lower().lstrip("www.")
         if host in _SKIP_SCRAPE_DOMAINS or any(host.endswith("." + d) for d in _SKIP_SCRAPE_DOMAINS):
             return _store("")
     except Exception:
         pass
-
-    # ── Fetch HTML ────────────────────────────────────────────────────────
     try:
-        resp = requests.get(
-            url,
-            headers=_BROWSER_HEADERS,
-            timeout=5,
-            stream=True,
-            allow_redirects=True,
-        )
+        resp = requests.get(url, headers=_BROWSER_HEADERS, timeout=5, stream=True, allow_redirects=True)
         if resp.status_code not in (200, 203):
             return _store("")
         ct = resp.headers.get("Content-Type", "")
         if ct and "html" not in ct.lower():
             return _store("")
-
-        # Read up to 400 KB — enough for <head> + early <body>
         raw = b""
         for chunk in resp.iter_content(chunk_size=8192):
             raw += chunk
             if len(raw) >= 400_000:
                 break
-
         html = raw.decode("utf-8", errors="replace")
-        base_url = resp.url  # final URL after redirects
-
+        base_url = resp.url
     except Exception:
         return _store("")
-
-    # ── Parse HTML once ───────────────────────────────────────────────────
     try:
         soup = BeautifulSoup(html, "html.parser")
     except Exception:
         return _store("")
-
-    # ── PRIORITY 1 & 2: Open Graph ────────────────────────────────────────
     for prop in ("og:image:secure_url", "og:image"):
         tag = soup.find("meta", property=prop)
         if tag:
             src = _is_valid_image_url((tag.get("content") or "").strip(), base_url)
             if src:
                 return _store(src)
-
-    # ── PRIORITY 3: Twitter Card ──────────────────────────────────────────
     for name in ("twitter:image:src", "twitter:image"):
         tag = soup.find("meta", attrs={"name": name})
         if tag:
             src = _is_valid_image_url((tag.get("content") or "").strip(), base_url)
             if src:
                 return _store(src)
-
-    # ── PRIORITY 4: JSON-LD (schema.org) ─────────────────────────────────
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             raw_json = script.string or ""
             if not raw_json.strip():
                 continue
             data = json.loads(raw_json)
-            # JSON-LD can be a list or a dict
             items = data if isinstance(data, list) else [data]
             for item in items:
-                # Handle @graph wrapper
                 if "@graph" in item:
                     items.extend(item["@graph"])
                     continue
@@ -767,9 +695,6 @@ def extract_thumbnail(url: str) -> str:
                     return _store(src)
         except Exception:
             continue
-
-    # ── PRIORITY 5: Best scored <img> in article body ─────────────────────
-    # Look inside article/main containers first, then whole body
     containers = (
         soup.find_all("article") or
         soup.find_all("main") or
@@ -777,7 +702,6 @@ def extract_thumbnail(url: str) -> str:
         [soup.body]
     )
     containers = [c for c in containers if c]
-
     best_score, best_src = 0, ""
     for container in containers[:3]:
         for img_tag in container.find_all("img")[:40]:
@@ -785,17 +709,10 @@ def extract_thumbnail(url: str) -> str:
             if score > best_score:
                 best_score = score
                 best_src = src
-
     if best_src and best_score >= 15:
         return _store(best_src)
-
     return _store("")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ══ TOPIC-BASED FALLBACK IMAGE (for when scraping yields nothing) ═══════════
-# Uses deterministic Wikimedia URLs — topic-relevant, permanent, free
-# ─────────────────────────────────────────────────────────────────────────────
 
 _TOPIC_FALLBACKS = {
     "war": [
@@ -845,11 +762,8 @@ _TOPIC_FALLBACKS = {
 
 
 def _make_fallback_image(title: str, index: int = 0) -> str:
-    """Returns a topic-relevant fallback image URL based on article title."""
     t     = (title or "").lower()
     t_raw = (title or "")
-
-    # Hindi keyword detection
     HINDI_MAP = [
         ("space",    ["इसरो", "चंद्रयान", "गगनयान", "अंतरिक्ष", "नासा", "रॉकेट", "उपग्रह"]),
         ("sports",   ["क्रिकेट", "विश्व कप", "आईपीएल", "रोहित", "विराट", "धोनी", "टी20"]),
@@ -864,8 +778,6 @@ def _make_fallback_image(title: str, index: int = 0) -> str:
         if any(kw in t_raw for kw in kws):
             imgs = _TOPIC_FALLBACKS.get(topic, _TOPIC_FALLBACKS["news"])
             return imgs[index % len(imgs)]
-
-    # English keyword detection
     if any(k in t for k in ["ukraine", "russia", "war", "conflict", "invasion", "putin", "zelensky", "nato", "missile", "troops"]):
         topic = "war"
     elif any(k in t for k in ["israel", "gaza", "hamas", "palestine"]):
@@ -890,13 +802,11 @@ def _make_fallback_image(title: str, index: int = 0) -> str:
         topic = "factcheck"
     else:
         topic = "news"
-
     imgs = _TOPIC_FALLBACKS.get(topic, _TOPIC_FALLBACKS["news"])
     return imgs[index % len(imgs)]
 
 
 def _is_clean_image(url: str) -> bool:
-    """Quick check: is this URL a usable image (not favicon/tracking pixel/etc)?"""
     if not url or not isinstance(url, str):
         return False
     url = url.strip()
@@ -908,66 +818,39 @@ def _is_clean_image(url: str) -> bool:
     return not any(b in ul for b in BAD)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ══ ARTICLE IMAGE RESOLVER — integrates extract_thumbnail into pipeline ══════
-# ─────────────────────────────────────────────────────────────────────────────
-
 def resolve_article_image(newsapi_url_to_image: str, rss_img: str,
                           article_url: str, title: str, index: int = 0) -> str:
-    """
-    Full resolution pipeline for a single article thumbnail.
-
-    1. NewsAPI urlToImage  → validated directly (already fetched by NewsAPI)
-    2. RSS media image     → validated directly
-    3. extract_thumbnail() → scrape OG/Twitter/JSON-LD/best-img from article page
-    4. Topic fallback      → deterministic Wikimedia image based on title keywords
-
-    Never returns None or empty string — always returns a usable URL.
-    """
-    # 1. NewsAPI image — most reliable since NewsAPI already resolved it
     if newsapi_url_to_image and _is_clean_image(newsapi_url_to_image):
         cleaned = _is_valid_image_url(newsapi_url_to_image)
         if cleaned:
             return cleaned
-
-    # 2. RSS image
     if rss_img and _is_clean_image(rss_img):
         cleaned = _is_valid_image_url(rss_img)
         if cleaned:
             return cleaned
-
-    # 3. Scrape the article page
     if article_url and article_url.startswith("http"):
-        # Resolve redirects (Google News, t.co, etc.)
         real_url = _resolve_redirect(article_url)
         scraped  = extract_thumbnail(real_url)
         if scraped:
             return scraped
-
-    # 4. Topic fallback
     return _make_fallback_image(title, index)
 
 
 def _resolve_redirect(url: str) -> str:
-    """Follow redirects for known redirect hosts (Google News, t.co, etc.)."""
     REDIRECT_HOSTS = ("news.google.com", "t.co", "bit.ly", "ow.ly",
                       "tinyurl.com", "buff.ly", "dlvr.it")
     try:
         host = urlparse(url).netloc.lower()
     except Exception:
         return url
-
     if not any(h in host for h in REDIRECT_HOSTS):
         return url
-
     cache_key = "__redirect__" + url
     cached = THUMBNAIL_CACHE.get(cache_key)
     if cached and (time.time() - cached["ts"]) < CACHE_EXPIRY_SECONDS:
         return cached.get("image") or url
-
     try:
-        r = requests.get(url, headers=_BROWSER_HEADERS,
-                         allow_redirects=True, timeout=5)
+        r = requests.get(url, headers=_BROWSER_HEADERS, allow_redirects=True, timeout=5)
         final = r.url
         if final and "news.google.com" not in final and final.startswith("http"):
             THUMBNAIL_CACHE[cache_key] = {"image": final, "ts": time.time()}
@@ -979,11 +862,6 @@ def _resolve_redirect(url: str) -> str:
 
 def fetch_images_parallel(articles: list, url_key: str = "link",
                           image_key: str = "image") -> None:
-    """
-    Parallel thumbnail resolution for a batch of articles.
-    Articles that already have a valid image are skipped.
-    Results are written in-place into the article dicts.
-    """
     BLOCKED_DOMAINS = {"ft.com", "wsj.com"}
 
     def _blocked(u: str) -> bool:
@@ -993,13 +871,11 @@ def fetch_images_parallel(articles: list, url_key: str = "link",
         except Exception:
             return False
 
-    # Identify articles that need image resolution
     missing = [
         i for i, a in enumerate(articles)
         if not a.get(image_key) or not _is_clean_image(a.get(image_key, ""))
     ]
     scrapable = [i for i in missing if not _blocked(articles[i].get(url_key, ""))]
-
     if scrapable:
         max_workers = min(6, len(scrapable))
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -1023,8 +899,6 @@ def fetch_images_parallel(articles: list, url_key: str = "link",
                         articles[i][image_key] = img
                 except Exception:
                     pass
-
-    # Final pass: ensure every article has at least the fallback image
     for idx, article in enumerate(articles):
         img = article.get(image_key, "")
         if not img or not _is_clean_image(img):
@@ -1034,7 +908,6 @@ def fetch_images_parallel(articles: list, url_key: str = "link",
 
 
 def _rss_item_image(item) -> str:
-    """Extract image URL from an RSS item's media tags."""
     SKIP = ['logo', 'icon', 'sprite', 'favicon', 'avatar', 'placeholder',
             'blank', 'pixel', 'spacer', '1x1', 'tracking', 'beacon',
             'news.google.com', 'google.com/s2']
@@ -1058,13 +931,11 @@ def _rss_item_image(item) -> str:
             img = _clean(el.get("url", ""))
             if img:
                 return img
-
     enc = item.find("enclosure")
     if enc and "image" in enc.get("type", ""):
         img = _clean(enc.get("url", ""))
         if img:
             return img
-
     desc_el = item.find("description")
     if desc_el:
         m = re.search(r'<img[^>]+src=["\']([^"\']{10,})["\']', str(desc_el), re.I)
@@ -1072,13 +943,8 @@ def _rss_item_image(item) -> str:
             img = _clean(m.group(1))
             if img:
                 return img
-
     return ""
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ── EVENT DETECTION ────────────────────────────────────────────────────────────
-# ═══════════════════════════════════════════════════════════════════════════════
 
 EVENT_TYPE_RULES = [
     (r'\b(us|u\.s\.|united states|american|presidential)\s+(election|elections|vote|voting)\b',
@@ -1211,10 +1077,6 @@ def detect_event_type(text):
             return etype, topic
     return None, None
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ── KEYWORD EXTRACTION ─────────────────────────────────────────────────────────
-# ═══════════════════════════════════════════════════════════════════════════════
 
 KNOWN_ENTITIES = [
     "Donald Trump", "Joe Biden", "Kamala Harris", "Barack Obama",
@@ -1418,10 +1280,6 @@ def extract_newsapi_keywords(text):
     return parts[:5]
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ── WIKIPEDIA TOPIC RESOLUTION ─────────────────────────────────────────────────
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def resolve_wiki_topic(claim_keywords, text):
     text_lower = text.lower()
     event_type, event_wiki = detect_event_type(text)
@@ -1475,10 +1333,6 @@ def resolve_wiki_topic(claim_keywords, text):
                 return WIKI_TOPIC_MAP[kl]
     return ""
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ── TWITTER QUERY GENERATION ───────────────────────────────────────────────────
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def generate_twitter_query(text, all_keywords, prediction):
     t_lower = text.lower()
@@ -1568,10 +1422,6 @@ def generate_twitter_query(text, all_keywords, prediction):
     return queries[:7]
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ── CORE SCORING ENGINE ────────────────────────────────────────────────────────
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def score_claim(text):
     text_lower = text.lower()
     text_clean = re.sub(r'[^\w\s]', ' ', text_lower)
@@ -1636,8 +1486,6 @@ def check_misinformation_kb(text):
     return best_match
 
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
-
 def get_source_favicon(source_name):
     if not source_name:
         return ""
@@ -1686,8 +1534,6 @@ def time_ago(published_at):
     except Exception:
         return published_at[:10]
 
-
-# ─── Wikipedia ────────────────────────────────────────────────────────────────
 
 def fetch_wiki_image(page_title):
     SKIP = ["flag","icon","logo","symbol","edit","question","OOjs","Portal",
@@ -1806,8 +1652,6 @@ def fetch_wikipedia_context(claim_keywords, hindi=False, original_text="",
                 continue
     return {}
 
-
-# ─── NewsAPI ──────────────────────────────────────────────────────────────────
 
 def _build_news_queries(claim_text, prediction, for_hindi=False):
     work_text = claim_text
@@ -2191,8 +2035,6 @@ def fetch_more_articles(claim_text, prediction, all_keywords, exclude_urls=None)
     return articles_out[:5]
 
 
-# ─── Twitter / Nitter ─────────────────────────────────────────────────────────
-
 def fetch_nitter_discussion(claim_text, keywords, prediction):
     twitter_queries = generate_twitter_query(claim_text, keywords, prediction)
     tweets, seen_txt = [], set()
@@ -2331,23 +2173,10 @@ def fetch_nitter_discussion(claim_text, keywords, prediction):
     return tweets[:5]
 
 
-# ─── Reddit ───────────────────────────────────────────────────────────────────
-
 def fetch_reddit_posts(claim_text, all_keywords, prediction, kb_match_fake=None):
-    """
-    Robust Reddit post fetcher — always returns posts.
-
-    Pipeline (stops as soon as we have 5 posts):
-      1. Reddit JSON API  — global search, multiple User-Agents, all queries
-      2. Reddit JSON API  — per-subreddit search (restrict_sr=1)
-      3. Reddit RSS feed  — /search.rss (no auth needed, different rate-limit bucket)
-      4. Google News RSS  — "site:reddit.com <query>" (always works)
-      5. Guaranteed fallback — static clickable Reddit search links so UI never empty
-    """
     kw = [k for k in all_keywords if all(ord(c) < 128 for c in k)][:5]
     if not kw:
         kw = extract_newsapi_keywords(claim_text)
-    # Also pull from event detection for better queries
     _, event_wiki = detect_event_type(claim_text)
     if event_wiki and not kw:
         skip_ew = {"the","a","an","of","by","in","on","at","and","or","conspiracy","misinformation","theories","theory","denial"}
@@ -2369,17 +2198,14 @@ def fetch_reddit_posts(claim_text, all_keywords, prediction, kb_match_fake=None)
         queries    = [q_main, q_short, q_one, q_main + " news", q_short + " latest"]
         subreddits = ["worldnews", "news", "india", "technology", "science", "cricket", "geopolitics", "investing"]
 
-    # Remove empty/duplicate queries
     seen_q, clean_queries = set(), []
     for q in queries:
         q = q.strip()
         if q and q.lower() not in seen_q:
             seen_q.add(q.lower()); clean_queries.append(q)
     queries = clean_queries
-
     posts, seen_titles = [], set()
 
-    # ── Multiple User-Agents to avoid Reddit blocking one ─────────────────
     REDDIT_UA_POOL = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
@@ -2422,11 +2248,10 @@ def fetch_reddit_posts(claim_text, all_keywords, prediction, kb_match_fake=None)
             "source":       "reddit",
         }
 
-    # ── PHASE 1: Reddit JSON global search — try all queries + UA rotation ──
     for qi, q in enumerate(queries):
         if len(posts) >= 5:
             break
-        for ua_i in range(2):  # try 2 different User-Agents per query
+        for ua_i in range(2):
             if len(posts) >= 5:
                 break
             try:
@@ -2437,7 +2262,7 @@ def fetch_reddit_posts(claim_text, all_keywords, prediction, kb_match_fake=None)
                     timeout=8,
                 )
                 if r.status_code == 429:
-                    time.sleep(0.5)  # brief back-off on rate limit
+                    time.sleep(0.5)
                     continue
                 if r.status_code != 200:
                     continue
@@ -2448,11 +2273,10 @@ def fetch_reddit_posts(claim_text, all_keywords, prediction, kb_match_fake=None)
                     if post:
                         posts.append(post)
                 if posts:
-                    break  # got results from this query — move to next
+                    break
             except Exception:
                 continue
 
-    # ── PHASE 2: Per-subreddit search ─────────────────────────────────────
     if len(posts) < 5:
         for si, sr in enumerate(subreddits):
             if len(posts) >= 5:
@@ -2479,18 +2303,13 @@ def fetch_reddit_posts(claim_text, all_keywords, prediction, kb_match_fake=None)
             except Exception:
                 continue
 
-    # ── PHASE 3: Reddit RSS feed — different rate-limit bucket ───────────
     if len(posts) < 3:
         for q in queries[:3]:
             if len(posts) >= 5:
                 break
             try:
                 rss_url = f"https://www.reddit.com/search.rss?q={urllib.parse.quote(q)}&sort=relevance&limit=10"
-                r = requests.get(
-                    rss_url,
-                    headers={"User-Agent": REDDIT_UA_POOL[2]},
-                    timeout=7,
-                )
+                r = requests.get(rss_url, headers={"User-Agent": REDDIT_UA_POOL[2]}, timeout=7)
                 if r.status_code != 200:
                     continue
                 soup = BeautifulSoup(r.content, "xml")
@@ -2525,21 +2344,15 @@ def fetch_reddit_posts(claim_text, all_keywords, prediction, kb_match_fake=None)
                     if content_el:
                         selftext = re.sub(r'<[^>]+>', '', content_el.get_text(strip=True))[:200]
                     posts.append({
-                        "title":        title,
-                        "text":         selftext,
-                        "subreddit":    subreddit_label,
-                        "score":        0,
-                        "num_comments": 0,
-                        "url":          url,
-                        "time_ago":     t_ago,
-                        "is_debunk":    has_debunk_signal((title + " " + selftext).lower()),
-                        "source":       "reddit_rss",
+                        "title": title, "text": selftext,
+                        "subreddit": subreddit_label, "score": 0, "num_comments": 0,
+                        "url": url, "time_ago": t_ago,
+                        "is_debunk": has_debunk_signal((title + " " + selftext).lower()),
+                        "source": "reddit_rss",
                     })
             except Exception:
                 continue
 
-    # ── PHASE 4: Google News RSS  "site:reddit.com <query>" ─────────────
-    # This never fails — Google News always has Reddit results
     if len(posts) < 3:
         for q in queries[:2]:
             if len(posts) >= 5:
@@ -2562,7 +2375,6 @@ def fetch_reddit_posts(claim_text, all_keywords, prediction, kb_match_fake=None)
                     if not title_el:
                         continue
                     title = title_el.get_text(strip=True)
-                    # Strip " - r/subreddit" suffix Google News adds
                     subreddit_label = "r/worldnews"
                     sr_match = re.search(r'[-–]\s*(r/\w+)', title)
                     if sr_match:
@@ -2586,21 +2398,15 @@ def fetch_reddit_posts(claim_text, all_keywords, prediction, kb_match_fake=None)
                         except Exception:
                             pass
                     posts.append({
-                        "title":        title,
-                        "text":         "",
-                        "subreddit":    subreddit_label,
-                        "score":        0,
-                        "num_comments": 0,
-                        "url":          use_url,
-                        "time_ago":     t_ago,
-                        "is_debunk":    has_debunk_signal(title.lower()),
-                        "source":       "google_reddit",
+                        "title": title, "text": "",
+                        "subreddit": subreddit_label, "score": 0, "num_comments": 0,
+                        "url": use_url, "time_ago": t_ago,
+                        "is_debunk": has_debunk_signal(title.lower()),
+                        "source": "google_reddit",
                     })
             except Exception:
                 continue
 
-    # ── PHASE 5: Guaranteed fallback — clickable Reddit search links ──────
-    # UI will ALWAYS show something — never an empty Reddit section
     if len(posts) < 3:
         FALLBACK_SUBREDDITS = [
             ("r/worldnews",  "World news discussions"),
@@ -2622,24 +2428,16 @@ def fetch_reddit_posts(claim_text, all_keywords, prediction, kb_match_fake=None)
                 continue
             seen_titles.add(fallback_title)
             posts.append({
-                "title":        fallback_title,
-                "text":         f"Click to find Reddit discussions about this topic in {sr_name} — {sr_desc}.",
-                "subreddit":    sr_name,
-                "score":        0,
-                "num_comments": 0,
-                "url":          search_url,
-                "time_ago":     "",
-                "is_debunk":    False,
-                "source":       "fallback",
+                "title": fallback_title,
+                "text": f"Click to find Reddit discussions about this topic in {sr_name} — {sr_desc}.",
+                "subreddit": sr_name, "score": 0, "num_comments": 0,
+                "url": search_url, "time_ago": "", "is_debunk": False, "source": "fallback",
             })
 
     if prediction == "FAKE NEWS":
         posts.sort(key=lambda p: 0 if p["is_debunk"] else 1)
-
     return posts[:5]
 
-
-# ─── Google Fact Check ────────────────────────────────────────────────────────
 
 def fetch_google_factchecks(query):
     try:
@@ -2671,8 +2469,6 @@ def fetch_google_factchecks(query):
     except Exception:
         return []
 
-
-# ─── AI Verdicts ──────────────────────────────────────────────────────────────
 
 def _build_prompt(claim_text, prediction, fake_prob, real_prob):
     return f"""You are a professional fact-checker and misinformation analyst.
@@ -2807,8 +2603,6 @@ def build_consensus(verdicts):
     }
 
 
-# ─── Pattern Analysis ─────────────────────────────────────────────────────────
-
 def analyze_patterns(text):
     text_lower = text.lower()
     suspicious, credible = [], []
@@ -2874,8 +2668,6 @@ def build_explanation(prediction, suspicious, credible, confidence, fake_prob, r
             parts.append(f"Fact-checkers ({', '.join(fc_names[:3])}): {'; '.join(ratings[:3])}.")
     return " ".join(parts)
 
-
-# ─── Routes ───────────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
@@ -2946,7 +2738,6 @@ async def predict(request: Request, text: str = Form(...)):
 
     fake_rate = round((stats["fake"] / stats["total"]) * 100)
 
-    # Final image safety pass — ensure every article has a valid image
     for idx, a in enumerate(related_news + more_articles):
         img = a.get("image", "")
         if not img or not _is_clean_image(img):
