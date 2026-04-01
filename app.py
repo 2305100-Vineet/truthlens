@@ -45,7 +45,7 @@ CACHE_EXPIRY_SECONDS = 3600  # 1 hour
 
 NEWS_API_KEY      = "74451a00a3da4031907869f3295f3683"
 GOOGLE_FC_API_KEY = "AIzaSyD4rl4NbYwWgaJ35z6P3KI4BUYlFxmZMBs"
-GROQ_API_KEY      = "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"
+GROQ_API_KEY      = "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"
 COHERE_API_KEY    = "dguuEWbNOKc8jbW6QFOB7QTC2igY49DWa2qWWXJL"
 WIKIPEDIA_API     = "https://en.wikipedia.org/api/rest_v1/page/summary/"
 WIKIPEDIA_HI_API  = "https://hi.wikipedia.org/api/rest_v1/page/summary/"
